@@ -16989,8 +16989,11 @@ class GatewayRunner:
                 if preview:
                     from agent.display import get_tool_preview_max_len
                     _pl = get_tool_preview_max_len()
-                    _cap = _pl if _pl > 0 else 40
-                    if len(preview) > _cap:
+                    # Terminal commands are the one compact detail users most
+                    # often need verbatim.  Other tools keep the persistent
+                    # chat status bounded unless explicitly configured longer.
+                    _cap = 0 if tool_name == "terminal" else (_pl if _pl > 0 else 40)
+                    if _cap > 0 and len(preview) > _cap:
                         preview = preview[:_cap - 3] + "..."
                     latest = f"{emoji} {tool_name}: \"{preview}\""
                 else:
