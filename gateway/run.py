@@ -12833,8 +12833,8 @@ class GatewayRunner:
         """Handle /verbose command — cycle tool progress display mode.
 
         Gated by ``display.tool_progress_command`` in config.yaml (default off).
-        When enabled, cycles the tool progress mode through off → new → all →
-        verbose → off for the *current platform*.  The setting is saved to
+        When enabled, cycles the tool progress mode through off → compact →
+        new → all → verbose → off for the *current platform*.  The setting is saved to
         ``display.platforms.<platform>.tool_progress`` so each channel can
         have its own verbosity level independently.
         """
@@ -12856,9 +12856,10 @@ class GatewayRunner:
             return t("gateway.verbose.not_enabled")
 
         # --- cycle mode (per-platform) ----------------------------------------
-        cycle = ["off", "new", "all", "verbose"]
+        cycle = ["off", "compact", "new", "all", "verbose"]
         descriptions = {
             "off": t("gateway.verbose.mode_off"),
+            "compact": "⚙️ Tool progress: **COMPACT** — one editable status line with call count and latest tool.",
             "new": t("gateway.verbose.mode_new"),
             "all": t("gateway.verbose.mode_all"),
             "verbose": t("gateway.verbose.mode_verbose"),
@@ -16892,6 +16893,7 @@ class GatewayRunner:
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
+        compact_tool_count = [0]  # Number of tool starts summarized in compact mode
 
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
@@ -16978,6 +16980,27 @@ class GatewayRunner:
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
+
+            # Compact mode: keep one editable status line for the current tool
+            # segment instead of accumulating one permanent line per call. This
+            # preserves "where is it at?" signal without flooding project chats.
+            if progress_mode == "compact":
+                compact_tool_count[0] += 1
+                if preview:
+                    from agent.display import get_tool_preview_max_len
+                    _pl = get_tool_preview_max_len()
+                    _cap = _pl if _pl > 0 else 40
+                    if len(preview) > _cap:
+                        preview = preview[:_cap - 3] + "..."
+                    latest = f"{emoji} {tool_name}: \"{preview}\""
+                else:
+                    latest = f"{emoji} {tool_name}"
+                plural = "" if compact_tool_count[0] == 1 else "s"
+                progress_queue.put((
+                    "__compact__",
+                    f"🔧 Working — {compact_tool_count[0]} tool call{plural}; latest: {latest}",
+                ))
+                return
             
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
@@ -17227,8 +17250,8 @@ class GatewayRunner:
                         # Content bubble just landed on the platform — close off
                         # the current tool-progress bubble so the next tool
                         # starts a fresh bubble below the content. Without this,
-                        # tool lines keep editing the ORIGINAL progress message
-                        # above the new content, making the chat appear out of
+                        # subsequent tool lines would edit an older progress
+                        # bubble above newer assistant content, reversing chat
                         # order. Mirrors GatewayStreamConsumer.on_segment_break
                         # on the content side. (Issue: tool + content
                         # linearization regression after PR #7885.)
@@ -17236,7 +17259,11 @@ class GatewayRunner:
                         progress_lines = []
                         last_progress_msg[0] = None
                         repeat_count[0] = 0
+                        compact_tool_count[0] = 0
                         continue
+                    elif isinstance(raw, tuple) and len(raw) >= 2 and raw[0] == "__compact__":
+                        msg = raw[1]
+                        progress_lines = [msg]
                     else:
                         msg = raw
                         progress_lines.append(msg)

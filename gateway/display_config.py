@@ -110,7 +110,10 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
         "tool_progress": "off",
         "busy_ack_detail": False,
     },
-    "discord":     _TIER_HIGH,
+    # Discord project channels can generate hundreds of persistent tool lines
+    # during coding runs. Default to a single editable compact status bubble;
+    # users can opt back into per-tool lines with /verbose or config.
+    "discord":     {**_TIER_HIGH, "tool_progress": "compact"},
 
     # Tier 2 — edit support, often customer/workspace channels
     # Slack: tool_progress off by default — Bolt posts cannot be edited like CLI;
