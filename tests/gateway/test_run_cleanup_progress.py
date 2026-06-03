@@ -365,3 +365,109 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     # deletes at least one progress bubble.
     assert pre_existing_fired == [True]
     assert len(adapter.deleted) >= 1
+
+class CompactProgressAgent:
+    """Emits enough spaced tool events to exercise compact edit fallback."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        if cb is not None:
+            cb("tool.started", "terminal", "pwd", {})
+            time.sleep(1.7)
+            cb("tool.started", "terminal", "ls", {})
+            time.sleep(1.7)
+            cb("tool.started", "terminal", "git status", {})
+            time.sleep(0.25)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class CompactFlakyEditAdapter(CleanupCaptureAdapter):
+    """Discord-like adapter whose first edit fails, then future edits work."""
+
+    def __init__(self, *, retryable_first_failure: bool):
+        super().__init__(Platform.DISCORD)
+        self.retryable_first_failure = retryable_first_failure
+        self.edit_attempts = 0
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self.edit_attempts += 1
+        self.edits.append({"chat_id": chat_id, "message_id": message_id, "content": content})
+        if self.edit_attempts == 1:
+            return SendResult(
+                success=False,
+                error="Broken pipe" if self.retryable_first_failure else "Unknown Message",
+                retryable=self.retryable_first_failure,
+            )
+        return SendResult(success=True, message_id=message_id)
+
+
+def _install_compact_fakes(monkeypatch):
+    monkeypatch.delenv("HERMES_TOOL_PROGRESS_MODE", raising=False)
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CompactProgressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 — register tool emoji
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"platforms": {"discord": {"tool_progress": "compact"}}}},
+    )
+    return gateway_run
+
+
+@pytest.mark.asyncio
+async def test_compact_progress_retryable_edit_failure_does_not_send_extra_bubbles(monkeypatch, tmp_path):
+    adapter = CompactFlakyEditAdapter(retryable_first_failure=True)
+    runner = _make_runner(adapter)
+    gateway_run = _install_compact_fakes(monkeypatch)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=SessionSource(platform=Platform.DISCORD, chat_id="123"),
+        session_id="sess-compact-retryable",
+        session_key="agent:main:discord:group:123",
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 1
+    assert adapter.edit_attempts >= 2
+    assert all("🔧 Working" in entry["content"] for entry in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_compact_progress_permanent_edit_failure_recreates_one_bubble(monkeypatch, tmp_path):
+    adapter = CompactFlakyEditAdapter(retryable_first_failure=False)
+    runner = _make_runner(adapter)
+    gateway_run = _install_compact_fakes(monkeypatch)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=SessionSource(platform=Platform.DISCORD, chat_id="123"),
+        session_id="sess-compact-recreate",
+        session_key="agent:main:discord:group:123",
+    )
+
+    assert result["final_response"] == "done"
+    # First event creates a compact bubble; the stale/deleted edit target causes
+    # one replacement compact bubble. Future compact updates edit that bubble
+    # instead of degrading into one permanent message per tool call.
+    assert len(adapter.sent) == 2
+    assert adapter.edit_attempts >= 2
+    assert all("🔧 Working" in entry["content"] for entry in adapter.sent)

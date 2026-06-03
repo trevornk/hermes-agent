@@ -17319,6 +17319,19 @@ class GatewayRunner:
                                     adapter.name,
                                 )
                                 _last_edit_ts = time.monotonic()
+                            elif progress_mode == "compact":
+                                # Compact mode exists specifically to avoid chat
+                                # spam.  If the current editable bubble cannot
+                                # be edited (deleted, stale, or Discord hiccup
+                                # not classified retryable), recreate one
+                                # compact bubble and keep future updates bounded
+                                # instead of permanently degrading into one
+                                # platform message per tool call.
+                                logger.info(
+                                    "[%s] Compact progress edit failed; recreating progress bubble",
+                                    adapter.name,
+                                )
+                                progress_msg_id = None
                             else:
                                 can_edit = False
                             _flood_result = await adapter.send(
