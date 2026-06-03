@@ -17328,6 +17328,18 @@ class GatewayRunner:
                                 metadata=_progress_metadata,
                             )
                             if (
+                                progress_mode == "compact"
+                                and getattr(_flood_result, "success", False)
+                                and getattr(_flood_result, "message_id", None)
+                            ):
+                                # Compact progress is defined as one mutable
+                                # status bubble.  If the old bubble vanished
+                                # or could not be edited, the fallback send is
+                                # a replacement bubble, not a signal to revert
+                                # the rest of the run to one message per tool.
+                                progress_msg_id = _flood_result.message_id
+                                can_edit = True
+                            if (
                                 _cleanup_progress
                                 and getattr(_flood_result, "success", False)
                                 and getattr(_flood_result, "message_id", None)
