@@ -7363,7 +7363,10 @@ def cmd_gui(args: argparse.Namespace):
     sys.exit(launch_result.returncode)
 
 
-def _find_stale_dashboard_pids() -> list[int]:
+def _find_stale_dashboard_pids(
+    *,
+    exclude_pids: set[int] | None = None,
+) -> list[int]:
     """Return PIDs of ``hermes dashboard`` processes other than ourselves.
 
     ``hermes dashboard`` is a long-lived server process commonly started and
@@ -7377,6 +7380,15 @@ def _find_stale_dashboard_pids() -> list[int]:
     after an update is to kill the stale process and let the user restart
     it.  This helper is just the detection step; see
     ``_kill_stale_dashboard_processes`` for the kill.
+
+    *exclude_pids* is an optional set of PIDs that must never be returned.
+    This is used by the Hermes Desktop Electron app to protect its own
+    backend child process: when the desktop spawns ``hermes dashboard`` as
+    a backend and triggers an auto-update, the update must not kill the
+    dashboard that the desktop itself manages.  The desktop sets the
+    environment variable ``HERMES_DESKTOP_CHILD_PID`` on the spawned
+    backend process; ``_kill_stale_dashboard_processes`` reads it and
+    passes it here.  (#37532)
 
     Returns an empty list on any scan error (missing ps/wmic, timeout, etc.).
     """
@@ -7453,6 +7465,8 @@ def _find_stale_dashboard_pids() -> list[int]:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
 
+    if exclude_pids:
+        dashboard_pids = [p for p in dashboard_pids if p not in exclude_pids]
     return dashboard_pids
 
 
@@ -7604,7 +7618,18 @@ def _kill_stale_dashboard_processes(
     launch args (--host, --port, --insecure, --tui, --no-open).  The user
     restarts it manually; a hint is printed.
     """
-    pids = _find_stale_dashboard_pids()
+    # When the Hermes Desktop Electron app spawns this dashboard as a
+    # backend child, it sets HERMES_DESKTOP_CHILD_PID so that the update
+    # path can skip killing the desktop-managed process.  (#37532)
+    exclude: set[int] | None = None
+    raw_pid = os.environ.get("HERMES_DESKTOP_CHILD_PID")
+    if raw_pid:
+        try:
+            exclude = {int(raw_pid)}
+        except (ValueError, TypeError):
+            pass
+
+    pids = _find_stale_dashboard_pids(exclude_pids=exclude)
     if not pids:
         return
 
@@ -15167,7 +15192,7 @@ Examples:
     logs_parser = subparsers.add_parser(
         "logs",
         help="View and filter Hermes log files",
-        description="View, tail, and filter agent.log / errors.log / gateway.log / gui.log",
+        description="View, tail, and filter agent.log / errors.log / gateway.log / gui.log / desktop.log",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
@@ -15176,6 +15201,7 @@ Examples:
     hermes logs errors             Show last 50 lines of errors.log
     hermes logs gateway -n 100     Show last 100 lines of gateway.log
     hermes logs gui -f             Follow gui.log in real time
+    hermes logs desktop -f         Follow desktop.log (Electron app boot/backend)
     hermes logs --level WARNING    Only show WARNING and above
     hermes logs --session abc123   Filter by session ID
     hermes logs --component tools  Only show tool-related lines
