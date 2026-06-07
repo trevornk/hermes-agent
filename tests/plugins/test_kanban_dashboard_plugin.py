@@ -75,13 +75,29 @@ def test_board_empty(client):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
-    assert data["assignees"] == []
+    assert data["assignees"] == ["default"]
     assert data["latest_event_id"] == 0
 
 
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------
+
+
+def test_board_assignees_include_profiles_without_active_tasks(client, kanban_home):
+    """Profile picker should include known profiles even on a fresh board."""
+
+    profiles = kanban_home / "profiles"
+    profiles.mkdir(exist_ok=True)
+    for name in ("coder", "trev"):
+        profile = profiles / name
+        profile.mkdir()
+        (profile / "config.yaml").write_text("model: {}\n")
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    assert set(r.json()["assignees"]) >= {"coder", "trev"}
+
 
 
 def test_create_task_appears_on_board(client):

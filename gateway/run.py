@@ -12997,7 +12997,7 @@ class GatewayRunner:
         cycle = ["off", "compact", "new", "all", "verbose"]
         descriptions = {
             "off": t("gateway.verbose.mode_off"),
-            "compact": "Tool progress: COMPACT — one editable status line with call count and latest tool.",
+            "compact": "⚙️ Tool progress: **COMPACT** — one editable status line with call count and latest tool.",
             "new": t("gateway.verbose.mode_new"),
             "all": t("gateway.verbose.mode_all"),
             "verbose": t("gateway.verbose.mode_verbose"),
@@ -17187,6 +17187,30 @@ class GatewayRunner:
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
+
+            # Compact mode: keep one editable status line for the current tool
+            # segment instead of accumulating one permanent line per call. This
+            # preserves "where is it at?" signal without flooding project chats.
+            if progress_mode == "compact":
+                compact_tool_count[0] += 1
+                if preview:
+                    from agent.display import get_tool_preview_max_len
+                    _pl = get_tool_preview_max_len()
+                    # Terminal commands are the one compact detail users most
+                    # often need verbatim.  Other tools keep the persistent
+                    # chat status bounded unless explicitly configured longer.
+                    _cap = 0 if tool_name == "terminal" else (_pl if _pl > 0 else 40)
+                    if _cap > 0 and len(preview) > _cap:
+                        preview = preview[:_cap - 3] + "..."
+                    latest = f"{emoji} {tool_name}: \"{preview}\""
+                else:
+                    latest = f"{emoji} {tool_name}"
+                plural = "" if compact_tool_count[0] == 1 else "s"
+                progress_queue.put((
+                    "__compact__",
+                    f"🔧 Working — {compact_tool_count[0]} tool call{plural}; latest: {latest}",
+                ))
+                return
             
             # Compact mode: keep one editable status line for the current tool
             # segment instead of accumulating one permanent line per call.
@@ -17459,8 +17483,8 @@ class GatewayRunner:
                         # Content bubble just landed on the platform — close off
                         # the current tool-progress bubble so the next tool
                         # starts a fresh bubble below the content. Without this,
-                        # tool lines keep editing the ORIGINAL progress message
-                        # above the new content, making the chat appear out of
+                        # subsequent tool lines would edit an older progress
+                        # bubble above newer assistant content, reversing chat
                         # order. Mirrors GatewayStreamConsumer.on_segment_break
                         # on the content side. (Issue: tool + content
                         # linearization regression after PR #7885.)
@@ -17525,6 +17549,19 @@ class GatewayRunner:
                                     adapter.name,
                                 )
                                 _last_edit_ts = time.monotonic()
+                            elif progress_mode == "compact":
+                                # Compact mode exists specifically to avoid chat
+                                # spam.  If the current editable bubble cannot
+                                # be edited (deleted, stale, or Discord hiccup
+                                # not classified retryable), recreate one
+                                # compact bubble and keep future updates bounded
+                                # instead of permanently degrading into one
+                                # platform message per tool call.
+                                logger.info(
+                                    "[%s] Compact progress edit failed; recreating progress bubble",
+                                    adapter.name,
+                                )
+                                progress_msg_id = None
                             else:
                                 can_edit = False
                             _flood_result = await adapter.send(
@@ -17533,6 +17570,18 @@ class GatewayRunner:
                                 reply_to=_progress_reply_to,
                                 metadata=_progress_metadata,
                             )
+                            if (
+                                progress_mode == "compact"
+                                and getattr(_flood_result, "success", False)
+                                and getattr(_flood_result, "message_id", None)
+                            ):
+                                # Compact progress is defined as one mutable
+                                # status bubble.  If the old bubble vanished
+                                # or could not be edited, the fallback send is
+                                # a replacement bubble, not a signal to revert
+                                # the rest of the run to one message per tool.
+                                progress_msg_id = _flood_result.message_id
+                                can_edit = True
                             if (
                                 _cleanup_progress
                                 and getattr(_flood_result, "success", False)

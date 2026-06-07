@@ -110,9 +110,10 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
         "tool_progress": "off",
         "busy_ack_detail": False,
     },
-    # Discord channels are durable project workspaces, so keep progress useful
-    # without accumulating a long visible transcript of every tool call or
-    # model-generated interim note.
+    # Discord project channels can generate hundreds of persistent tool lines
+    # during coding runs. Default to a single editable compact status bubble;
+    # users can opt back into per-tool lines with /verbose or config, while
+    # default mid-turn commentary/debug detail stays quiet.
     "discord":     {
         **_TIER_HIGH,
         "tool_progress": "compact",

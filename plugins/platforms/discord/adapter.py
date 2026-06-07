@@ -1658,8 +1658,13 @@ class DiscordAdapter(BasePlatformAdapter):
             await msg.edit(content=formatted)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
+            error = str(e)
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
-            return SendResult(success=False, error=str(e))
+            return SendResult(
+                success=False,
+                error=error,
+                retryable=self._is_retryable_error(error),
+            )
 
     async def _send_file_attachment(
         self,

@@ -43,6 +43,9 @@ class TestResolveDisplaySetting:
         # Telegram is a mobile inbox by default — final-answer-first unless
         # explicitly configured otherwise.
         assert resolve_display_setting(config, "telegram", "tool_progress") == "off"
+        # Discord coding/project channels default to compact progress so a run
+        # shows status without accumulating one line per tool call.
+        assert resolve_display_setting(config, "discord", "tool_progress") == "compact"
         # Email defaults to tier_minimal → "off"
         assert resolve_display_setting(config, "email", "tool_progress") == "off"
 
@@ -184,7 +187,7 @@ class TestPlatformDefaults:
 
         # Telegram: tier_high transport, but quiet mobile default.
         assert resolve_display_setting({}, "telegram", "tool_progress") == "off"
-        # Discord: editable project-chat progress without line accumulation.
+        # Discord: editable status, but compact by default to avoid coding-channel spam.
         assert resolve_display_setting({}, "discord", "tool_progress") == "compact"
 
     def test_medium_tier_platforms(self):
