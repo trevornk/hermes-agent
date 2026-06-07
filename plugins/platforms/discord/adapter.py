@@ -3090,16 +3090,23 @@ class DiscordAdapter(BasePlatformAdapter):
                 name_lower = member.name.lower()
                 display_lower = member.display_name.lower()
                 global_lower = (member.global_name or "").lower()
-
-                matched = name_lower in to_resolve or display_lower in to_resolve or global_lower in to_resolve
-                if matched:
+                discriminator = str(getattr(member, "discriminator", "") or "").lower()
+                full_tag_lower = (
+                    f"{name_lower}#{discriminator}"
+                    if discriminator and discriminator != "0"
+                    else ""
+                )
+                candidates = {name_lower, display_lower, global_lower}
+                if full_tag_lower:
+                    candidates.add(full_tag_lower)
+                candidates.discard("")
+                matched_names = candidates & to_resolve
+                if matched_names:
                     uid = str(member.id)
                     numeric_ids.add(uid)
                     resolved_count += 1
-                    matched_name = name_lower if name_lower in to_resolve else (
-                        display_lower if display_lower in to_resolve else global_lower
-                    )
-                    to_resolve.discard(matched_name)
+                    matched_name = sorted(matched_names, key=lambda v: ("#" not in v, v))[0]
+                    to_resolve.difference_update(matched_names)
                     print(f"[{self.name}] Resolved '{matched_name}' -> {uid} ({member.name}#{member.discriminator})")
 
             if not to_resolve:

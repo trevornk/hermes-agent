@@ -179,13 +179,13 @@ class TestPlatformDefaults:
     """Built-in defaults reflect platform capability tiers."""
 
     def test_high_tier_platforms(self):
-        """Discord defaults to 'all'; Telegram defaults quiet for mobile."""
+        """Discord defaults compact; Telegram defaults quiet for mobile."""
         from gateway.display_config import resolve_display_setting
 
         # Telegram: tier_high transport, but quiet mobile default.
         assert resolve_display_setting({}, "telegram", "tool_progress") == "off"
-        # Discord: pure tier_high.
-        assert resolve_display_setting({}, "discord", "tool_progress") == "all"
+        # Discord: editable project-chat progress without line accumulation.
+        assert resolve_display_setting({}, "discord", "tool_progress") == "compact"
 
     def test_medium_tier_platforms(self):
         """Mattermost, Matrix, Feishu, WhatsApp default to 'new' tool progress."""
@@ -242,10 +242,10 @@ class TestPlatformDefaults:
         # default on Telegram (mobile chat is cramped enough without
         # "iteration 21/60" debug detail).
         assert resolve_display_setting({}, "telegram", "busy_ack_detail") is False
-        # Discord keeps all of these on (desktop-first, more vertical space).
-        assert resolve_display_setting({}, "discord", "interim_assistant_messages") is True
+        # Discord keeps heartbeats on, but avoids mid-turn commentary/debug detail.
+        assert resolve_display_setting({}, "discord", "interim_assistant_messages") is False
         assert resolve_display_setting({}, "discord", "long_running_notifications") is True
-        assert resolve_display_setting({}, "discord", "busy_ack_detail") is True
+        assert resolve_display_setting({}, "discord", "busy_ack_detail") is False
 
     def test_telegram_mobile_chatter_can_opt_in(self):
         """Per-platform config can re-enable Telegram busy-ack detail

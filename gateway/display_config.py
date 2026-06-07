@@ -110,7 +110,15 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
         "tool_progress": "off",
         "busy_ack_detail": False,
     },
-    "discord":     _TIER_HIGH,
+    # Discord channels are durable project workspaces, so keep progress useful
+    # without accumulating a long visible transcript of every tool call or
+    # model-generated interim note.
+    "discord":     {
+        **_TIER_HIGH,
+        "tool_progress": "compact",
+        "interim_assistant_messages": False,
+        "busy_ack_detail": False,
+    },
 
     # Tier 2 — edit support, often customer/workspace channels
     # Slack: tool_progress off by default — Bolt posts cannot be edited like CLI;

@@ -1,12 +1,13 @@
 import asyncio
 import json
+import os
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 
 
 class _FakeAllowedMentions:
@@ -905,3 +906,38 @@ async def test_safe_sync_detects_contexts_drift():
     fake_http.edit_global_command.assert_not_awaited()
     fake_http.delete_global_command.assert_awaited_once_with(999, 77)
     fake_http.upsert_global_command.assert_awaited_once_with(999, desired)
+
+@pytest.mark.asyncio
+async def test_resolve_allowed_usernames_accepts_full_discriminator_tag(monkeypatch):
+    from types import SimpleNamespace
+
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    adapter = object.__new__(DiscordAdapter)
+    adapter.platform = Platform.DISCORD
+    adapter._allowed_user_ids = {"195387386291683328", "votetrev#8760"}
+    adapter._client = SimpleNamespace(
+        guilds=[
+            SimpleNamespace(
+                name="Dyson's Domain",
+                member_count=1,
+                members=[
+                    SimpleNamespace(
+                        id=876012345678901234,
+                        name="votetrev",
+                        display_name="Dyson",
+                        global_name="votetrev",
+                        discriminator="8760",
+                    )
+                ],
+                fetch_members=None,
+            )
+        ]
+    )
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "195387386291683328,votetrev#8760")
+
+    await adapter._resolve_allowed_usernames()
+
+    assert adapter._allowed_user_ids == {"195387386291683328", "876012345678901234"}
+    assert os.environ["DISCORD_ALLOWED_USERS"] == "195387386291683328,876012345678901234"
+

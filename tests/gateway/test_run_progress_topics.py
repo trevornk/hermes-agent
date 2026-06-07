@@ -770,6 +770,32 @@ async def test_run_agent_rolls_progress_bubble_before_platform_limit(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_run_agent_compact_progress_replaces_editable_bubble(monkeypatch, tmp_path):
+    """compact mode should keep one current summary line instead of appending every tool."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ManyProgressLinesAgent,
+        session_id="sess-compact-progress",
+        config_data={
+            "display": {
+                "tool_progress": "compact",
+                "interim_assistant_messages": False,
+                "tool_preview_length": 60,
+            }
+        },
+        adapter_cls=SmallLimitProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    all_bubbles = [call["content"] for call in adapter.sent + adapter.edits]
+    assert all_bubbles
+    assert all("\n" not in text for text in all_bubbles)
+    assert all("tool call" in text and "latest:" in text for text in all_bubbles)
+    assert "8 tool calls" in all_bubbles[-1]
+
+
+@pytest.mark.asyncio
 async def test_run_agent_surfaces_real_interim_commentary(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,
