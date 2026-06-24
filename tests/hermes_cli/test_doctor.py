@@ -167,6 +167,21 @@ class TestDoctorToolAvailabilityOverrides:
 
         assert doctor._doctor_tool_availability_detail("kanban") == "(runtime-gated; loaded only for dispatcher-spawned workers)"
 
+    def test_filters_default_off_optional_toolsets(self, monkeypatch):
+        monkeypatch.setattr(doctor, "_honcho_is_configured_for_doctor", lambda: False)
+
+        available, unavailable = doctor._apply_doctor_tool_availability_overrides(
+            [],
+            [
+                {"name": "homeassistant", "env_vars": ["HASS_TOKEN"], "tools": ["ha_get_state"]},
+                {"name": "moa", "env_vars": ["OPENROUTER_API_KEY"], "tools": ["mixture_of_agents"]},
+                {"name": "x_search", "env_vars": ["XAI_API_KEY"], "tools": ["x_search"]},
+            ],
+        )
+
+        assert available == []
+        assert unavailable == []
+
 
 class TestHonchoDoctorConfigDetection:
     def test_reports_configured_when_enabled_with_api_key(self, monkeypatch):

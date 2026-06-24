@@ -326,6 +326,25 @@ class TestActiveFeatures:
         )
         assert "platform.slack" in ld.active_features()
 
+    def test_matrix_uses_mautrix_marker_not_shared_database_driver(self, monkeypatch):
+        # asyncpg is a generic dependency used by other features/projects. Its
+        # presence alone must not make update refresh the full Matrix stack,
+        # because Matrix encryption pulls python-olm, which currently fails to
+        # build on newer macOS/Clang systems unless Matrix was actually enabled.
+        monkeypatch.setattr(
+            ld,
+            "_is_present",
+            lambda spec: ld._pkg_name_from_spec(spec) == "asyncpg",
+        )
+        assert "platform.matrix" not in ld.active_features()
+
+        monkeypatch.setattr(
+            ld,
+            "_is_present",
+            lambda spec: ld._pkg_name_from_spec(spec) == "mautrix",
+        )
+        assert "platform.matrix" in ld.active_features()
+
 
 class TestRefreshActiveFeatures:
     def test_no_active_features_returns_empty(self, monkeypatch):

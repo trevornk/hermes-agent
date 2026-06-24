@@ -1,4 +1,5 @@
 import asyncio
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 import sys
@@ -42,7 +43,12 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import (  # noqa: E402
+    DiscordAdapter,
+    _DISCORD_SUPPRESS_EMBEDS_FLAG,
+    _apply_yaml_config,
+    _discord_should_suppress_embeds,
+)
 
 
 @pytest.mark.asyncio
@@ -445,3 +451,35 @@ async def test_typing_stop_cleans_up():
 
     await adapter.stop_typing("12345")
     assert "12345" not in adapter._typing_tasks
+
+
+def test_discord_suppress_embeds_can_be_scoped_to_channels(monkeypatch):
+    monkeypatch.delenv("DISCORD_SUPPRESS_EMBEDS", raising=False)
+    monkeypatch.delenv("DISCORD_SUPPRESS_EMBEDS_CHANNELS", raising=False)
+
+    assert _discord_should_suppress_embeds("1513945798088462536") is False
+
+    monkeypatch.setenv("DISCORD_SUPPRESS_EMBEDS_CHANNELS", "1513945798088462536,123")
+    assert _discord_should_suppress_embeds("1513945798088462536") is True
+    assert _discord_should_suppress_embeds("999") is False
+    assert _discord_should_suppress_embeds("parent", "123") is True
+
+    monkeypatch.setenv("DISCORD_SUPPRESS_EMBEDS", "true")
+    assert _discord_should_suppress_embeds("999") is True
+
+
+def test_apply_yaml_config_bridges_discord_suppress_embeds(monkeypatch):
+    monkeypatch.delenv("DISCORD_SUPPRESS_EMBEDS", raising=False)
+    monkeypatch.delenv("DISCORD_SUPPRESS_EMBEDS_CHANNELS", raising=False)
+
+    _apply_yaml_config(
+        {},
+        {
+            "suppress_embeds": False,
+            "suppress_embeds_channels": ["1513945798088462536", "123"],
+        },
+    )
+
+    assert _DISCORD_SUPPRESS_EMBEDS_FLAG == 4
+    assert os.environ["DISCORD_SUPPRESS_EMBEDS"] == "false"
+    assert os.environ["DISCORD_SUPPRESS_EMBEDS_CHANNELS"] == "1513945798088462536,123"

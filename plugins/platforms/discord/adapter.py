@@ -83,6 +83,43 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
     ),
     re.compile(r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)[\s\S]*$", re.IGNORECASE),
 )
+_DISCORD_SUPPRESS_EMBEDS_FLAG = 1 << 2
+
+
+def _csv_env_contains(value: str, needle: str) -> bool:
+    """Return True when ``needle`` appears in a comma-separated env value."""
+    needle = str(needle or "").strip()
+    if not needle:
+        return False
+    return needle in {part.strip() for part in str(value or "").split(",") if part.strip()}
+
+
+def _discord_should_suppress_embeds(chat_id: str | None = None, thread_id: str | None = None) -> bool:
+    """Whether outbound Discord messages should suppress URL embeds.
+
+    Discord previews are useful conversationally but make scheduled briefings
+    noisy. Operators can set ``discord.suppress_embeds: true`` globally or
+    ``discord.suppress_embeds_channels`` to a channel/thread allow-list.
+    """
+    raw_global = os.getenv("DISCORD_SUPPRESS_EMBEDS", "").strip().lower()
+    if raw_global in {"1", "true", "yes", "on"}:
+        return True
+    raw_channels = os.getenv("DISCORD_SUPPRESS_EMBEDS_CHANNELS", "")
+    if not raw_channels:
+        return False
+    return _csv_env_contains(raw_channels, str(thread_id or "")) or _csv_env_contains(raw_channels, str(chat_id or ""))
+
+
+def _discord_suppress_embeds_send_kwargs(chat_id: str | None = None, thread_id: str | None = None) -> Dict[str, Any]:
+    """discord.py ``send`` kwargs for embed suppression, omitted when disabled.
+
+    Omitting the kwarg in the default case preserves compatibility with test
+    doubles and older discord.py variants that may not accept ``suppress_embeds``.
+    """
+    if not _discord_should_suppress_embeds(chat_id, thread_id):
+        return {}
+    return {"suppress_embeds": True}
+
 
 try:
     import discord
@@ -1867,6 +1904,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     msg = await channel.send(
                         content=chunk,
                         reference=chunk_reference,
+                        **_discord_suppress_embeds_send_kwargs(chat_id, thread_id),
                     )
                 except Exception as e:
                     err_text = str(e)
@@ -1889,6 +1927,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         msg = await channel.send(
                             content=chunk,
                             reference=None,
+                            **_discord_suppress_embeds_send_kwargs(chat_id, thread_id),
                         )
                     else:
                         raise
@@ -6958,6 +6997,8 @@ async def _standalone_send(
                             for idx, path in enumerate(valid_media)
                         ]
                         starter_message = {"content": message, "attachments": attachments_meta}
+                        if _discord_should_suppress_embeds(chat_id):
+                            starter_message["flags"] = _DISCORD_SUPPRESS_EMBEDS_FLAG
                         payload_json = json.dumps({"name": thread_name, "message": starter_message})
 
                         form = aiohttp.FormData()
@@ -6986,7 +7027,10 @@ async def _standalone_send(
                             headers=json_headers,
                             json={
                                 "name": thread_name,
-                                "message": {"content": message},
+                                "message": {
+                                    "content": message,
+                                    **({"flags": _DISCORD_SUPPRESS_EMBEDS_FLAG} if _discord_should_suppress_embeds(chat_id) else {}),
+                                },
                             },
                             **_req_kw,
                         ) as resp:
@@ -7013,7 +7057,10 @@ async def _standalone_send(
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             # Send text message (skip if empty and media is present)
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
+                payload: Dict[str, Any] = {"content": message}
+                if _discord_should_suppress_embeds(chat_id, thread_id):
+                    payload["flags"] = _DISCORD_SUPPRESS_EMBEDS_FLAG
+                async with session.post(url, headers=json_headers, json=payload, **_req_kw) as resp:
                     if resp.status not in {200, 201}:
                         body = await resp.text()
                         return {"error": f"Discord API error ({resp.status}): {body}"}
@@ -7172,6 +7219,13 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
     if "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
         os.environ["DISCORD_THREAD_REQUIRE_MENTION"] = str(discord_cfg["thread_require_mention"]).lower()
+    if "suppress_embeds" in discord_cfg and not os.getenv("DISCORD_SUPPRESS_EMBEDS"):
+        os.environ["DISCORD_SUPPRESS_EMBEDS"] = str(discord_cfg["suppress_embeds"]).lower()
+    sec = discord_cfg.get("suppress_embeds_channels")
+    if sec is not None and not os.getenv("DISCORD_SUPPRESS_EMBEDS_CHANNELS"):
+        if isinstance(sec, list):
+            sec = ",".join(str(v) for v in sec)
+        os.environ["DISCORD_SUPPRESS_EMBEDS_CHANNELS"] = str(sec)
     platforms_cfg = yaml_cfg.get("platforms")
     platform_extra_cfg = {}
     if isinstance(platforms_cfg, dict):

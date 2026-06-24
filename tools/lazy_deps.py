@@ -437,6 +437,17 @@ def _allow_lazy_installs() -> bool:
     return True
 
 
+# Some lazy feature groups include generic packages that can be installed for
+# unrelated reasons. A feature should only be considered "active" by the
+# update-time refresh pass when one of its marker packages is present. Without
+# this, a shared dependency such as asyncpg can make Hermes try to refresh the
+# full Matrix stack on machines that never enabled Matrix, which currently pulls
+# python-olm and fails to build on newer macOS/Clang toolchains.
+ACTIVE_FEATURE_MARKERS: dict[str, tuple[str, ...]] = {
+    "platform.matrix": ("mautrix",),
+}
+
+
 def _spec_is_safe(spec: str) -> bool:
     """Reject pip specs that contain URLs, paths, or shell metacharacters."""
     if not spec or len(spec) > 200:
@@ -829,6 +840,11 @@ def active_features() -> list[str]:
     """
     active = []
     for feature, specs in LAZY_DEPS.items():
+        markers = ACTIVE_FEATURE_MARKERS.get(feature)
+        if markers is not None:
+            if any(_is_present(marker) for marker in markers):
+                active.append(feature)
+            continue
         if any(_is_present(s) for s in specs):
             active.append(feature)
     return active
