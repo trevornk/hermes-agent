@@ -1686,6 +1686,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         # turns so Anthropic-family providers don't 400 the summary call.
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
 
+        # [hermes-local] The summary path hand-builds messages and calls
+        # chat.completions.create() directly, bypassing build_api_kwargs — so the
+        # Claude-OAuth system-prompt scrub never ran here, causing the max-iteration
+        # summary to 400 "out of extra usage" on the Claude Code subscription. Apply
+        # it now (summary path bypasses build_api_kwargs). See _scrub_claude_oauth_triggers.
+        api_messages = _scrub_claude_oauth_triggers(agent, api_messages)
+
         summary_extra_body = {}
         try:
             from agent.auxiliary_client import _fixed_temperature_for_model, OMIT_TEMPERATURE as _OMIT_TEMP
