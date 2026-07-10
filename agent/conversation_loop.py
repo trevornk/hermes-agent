@@ -5290,6 +5290,36 @@ def run_conversation(
                 messages.append({"role": "assistant", "content": final_response})
                 break
     
+    # Silent-falloff fixup (cron false-failure bug, kanban t_da02e022 /
+    # scheduler issue #17855-adjacent): a verify-on-stop / pre_verify nudge
+    # can `continue` the loop after a valid no-tool-call final_response has
+    # already been produced and appended to `messages`. If that `continue`
+    # lands exactly when the iteration budget is exhausted, the `while`
+    # loop's own condition (not any of the explicit in-body `break`
+    # statements) ends the turn, so `_turn_exit_reason` never gets updated
+    # off its "unknown" initializer even though a real, complete answer is
+    # sitting in `final_response`. Downstream, `turn_finalizer.finalize_turn`
+    # only treats the turn as `completed` when `turn_exit_reason` starts
+    # with `"text_response("` (or the turn ended under max_iterations) — so
+    # this specific falloff got `completed=False` with a *real* answer in
+    # `final_response`, and `cron/scheduler.py` then wrapped that answer in
+    # `raise RuntimeError(final_response_text)`, reporting a successful run
+    # (e.g. the 2026-07-10 arb-platform PR #48 security-fix report) to
+    # Discord as a provider/auth-style failure. Detect the same signal
+    # `finalize_turn` will look for — usable trailing content, not the
+    # "(empty)" sentinel — and relabel it as a normal text completion so it
+    # is delivered instead of misclassified as a failure. Only fires when
+    # nothing already claimed a specific exit reason, so genuine
+    # budget_exhausted / interrupted / error paths are untouched.
+    if (
+        _turn_exit_reason == "unknown"
+        and not failed
+        and not interrupted
+        and (final_response or "").strip()
+        and (final_response or "").strip() != "(empty)"
+    ):
+        _turn_exit_reason = "text_response(finish_reason=loop_exit_after_valid_response)"
+
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
