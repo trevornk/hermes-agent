@@ -250,6 +250,17 @@ def _op_child_env(token_value: str) -> Dict[str, str]:
     if token_value:
         env["OP_SERVICE_ACCOUNT_TOKEN"] = token_value
     env["NO_COLOR"] = "1"
+    # `op`'s local cache/daemon (op-daemon.sock under $HOME/.config/op) has
+    # been observed hanging indefinitely on this host — see incident
+    # 2026-07-21: every `op read`/`op whoami` blocked forever once the daemon
+    # wedged, even after killing it and clearing ~/.config/op entirely (a
+    # fresh daemon respawned into the same stuck state within seconds). Disk
+    # cache is unaffected; --cache only governs the local read-through daemon
+    # process, and disabling it makes each call a direct request instead of
+    # going through that daemon. Force it off unconditionally rather than
+    # relying on a shell-level OP_CACHE export, since this env dict is built
+    # from an explicit allowlist and shell env is not inherited here.
+    env["OP_CACHE"] = "false"
     return env
 
 

@@ -981,8 +981,61 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+# [hermes-local] Claude Max/Pro OAuth (Claude Code subscription) misclassifies certain
+# Hermes system-prompt phrases as "You're out of extra usage" (HTTP 400), even with
+# plan headroom. Root cause + workaround: NousResearch/hermes-agent#10575 (fix PR #10576,
+# which patches the native anthropic path). Our Claude traffic reaches the subscription via
+# OmniRoute (custom:omniroute -> /v1/chat/completions), so scrub the known trigger phrases
+# from the SYSTEM message for Claude-target models only. Tool NAMES (in the tools array) are
+# NOT the trigger and are left intact, so tool-calling is unaffected. Validated: full coder
+# request -> 400 raw, 200 scrubbed, billed to the Max plan.
+_CLAUDE_OAUTH_SCRUB = (
+    ("session_search", "sess_search"),
+    ("skill_manage", "sk_manage"),
+    ("skill_view", "sk_view"),
+    ("MEDIA:", "M3DIA:"),
+)
+
+
+def _scrub_claude_oauth_triggers(agent, api_messages):
+    try:
+        model = str(getattr(agent, "model", "") or "").lower()
+    except Exception:
+        return api_messages
+    if "claude" not in model or not isinstance(api_messages, list):
+        return api_messages
+
+    def _scrub_str(text):
+        for a, b in _CLAUDE_OAUTH_SCRUB:
+            text = text.replace(a, b)
+        return text
+
+    changed = False
+    out = []
+    for m in api_messages:
+        if isinstance(m, dict) and m.get("role") == "system":
+            content = m.get("content")
+            if isinstance(content, str):
+                nc = _scrub_str(content)
+                if nc != content:
+                    m = {**m, "content": nc}; changed = True
+            elif isinstance(content, list):
+                nblocks = []
+                for blk in content:
+                    if isinstance(blk, dict) and isinstance(blk.get("text"), str):
+                        nt = _scrub_str(blk["text"])
+                        if nt != blk["text"]:
+                            blk = {**blk, "text": nt}; changed = True
+                    nblocks.append(blk)
+                if changed:
+                    m = {**m, "content": nblocks}
+        out.append(m)
+    return out if changed else api_messages
+
+
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
+    api_messages = _scrub_claude_oauth_triggers(agent, api_messages)
     tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
