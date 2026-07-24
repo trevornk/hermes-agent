@@ -997,12 +997,48 @@ _CLAUDE_OAUTH_SCRUB = (
 )
 
 
+def _moa_preset_targets_claude(agent):
+    # [hermes-local] MoA facade (provider: moa): agent.model is the PRESET name
+    # (e.g. "default") and base_url is "moa://local", so the "claude" model-name
+    # check below never fires -- but the preset's aggregator (the acting model)
+    # and/or reference slots can be Claude on the Claude Code OAuth subscription,
+    # which still 400s "out of extra usage" on the trigger phrases. Post-Neo
+    # consolidation this is exactly the default preset (aggregator
+    # claude-opus-4-8, reference claude-fable-5). Resolve the preset and scrub
+    # when any slot targets Claude; on any resolution failure err toward
+    # scrubbing (a scrub of a non-Claude prompt is harmless; an unscrubbed
+    # Claude prompt kills the turn with HTTP 400).
+    try:
+        base_url = str(getattr(agent, "base_url", "") or "").lower()
+        if not base_url.startswith("moa://"):
+            return False
+        from hermes_cli.config import load_config
+        from hermes_cli.moa_config import resolve_moa_preset
+
+        preset = resolve_moa_preset(
+            load_config().get("moa") or {},
+            str(getattr(agent, "model", "") or "default"),
+        )
+        slots = list(preset.get("reference_models") or [])
+        if isinstance(preset.get("aggregator"), dict):
+            slots.append(preset["aggregator"])
+        return any(
+            "claude" in str(s.get("model", "")).lower()
+            for s in slots
+            if isinstance(s, dict)
+        )
+    except Exception:
+        return True
+
+
 def _scrub_claude_oauth_triggers(agent, api_messages):
     try:
         model = str(getattr(agent, "model", "") or "").lower()
     except Exception:
         return api_messages
-    if "claude" not in model or not isinstance(api_messages, list):
+    if not isinstance(api_messages, list):
+        return api_messages
+    if "claude" not in model and not _moa_preset_targets_claude(agent):
         return api_messages
 
     def _scrub_str(text):
