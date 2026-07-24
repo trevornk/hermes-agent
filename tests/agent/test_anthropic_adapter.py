@@ -700,6 +700,29 @@ class TestResolveWithRefresh:
 
 
 class TestRunOauthSetupToken:
+    @pytest.fixture(autouse=True)
+    def _no_keychain_credentials(self, monkeypatch):
+        """Neutralise the macOS keychain credential source for this class.
+
+        These tests patch ``subprocess.run`` wholesale to fake the
+        ``claude setup-token`` invocation. ``run_oauth_setup_token()`` also
+        reaches ``read_claude_code_credentials()``, which on Darwin shells out
+        to ``security find-generic-password`` through that same
+        ``subprocess.run`` — so the mock made the keychain read look like it
+        succeeded and the reader then did ``json.loads(<MagicMock>)``, raising
+        TypeError (not JSONDecodeError, so the production guard did not catch
+        it). On Linux the keychain reader returns early on
+        ``platform.system() != "Darwin"``, which is why this only failed on
+        macOS.
+
+        The scenarios under test are "no credentials anywhere", so state that
+        explicitly instead of letting the platform decide.
+        """
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+            lambda: None,
+        )
+
     def test_raises_when_claude_not_installed(self, monkeypatch):
         monkeypatch.setattr("shutil.which", lambda _: None)
         with pytest.raises(FileNotFoundError, match="claude.*CLI.*not installed"):
