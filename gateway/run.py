@@ -6212,6 +6212,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not steered and not redirected:
             self._queue_or_replace_pending_event(session_key, event)
 
+        # Visibility for the silent-absorption failure mode. Nothing else on
+        # this path logs: a message handled here never reaches the "inbound
+        # message" line, so a leaked _running_agents slot (agent finished, entry
+        # never released -- #28686) swallows every follow-up with zero trace
+        # until the stale-eviction sweep fires ~HERMES_AGENT_TIMEOUT later.
+        # Reporting the running agent's real idle time next to "busy" makes the
+        # leak self-evident: a genuinely busy agent has a small idle value, a
+        # zombie one has a large and growing value.
+        _busy_started = self._running_agents_ts.get(session_key, 0)
+        _busy_age = (time.time() - _busy_started) if _busy_started else -1.0
+        _busy_idle = -1.0
+        if running_agent is not None and hasattr(running_agent, "get_activity_summary"):
+            try:
+                _busy_idle = float(
+                    running_agent.get_activity_summary().get(
+                        "seconds_since_activity", -1,
+                    )
+                )
+            except Exception:
+                pass
+        logger.info(
+            "Busy-path absorbed inbound message for session %s "
+            "(mode=%s steered=%s redirected=%s agent_age=%.0fs agent_idle=%.0fs)",
+            session_key, effective_mode, steered, redirected, _busy_age, _busy_idle,
+        )
+
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
         is_redirect_mode = effective_mode == "interrupt" and redirected
