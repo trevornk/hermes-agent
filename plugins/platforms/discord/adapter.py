@@ -1288,6 +1288,42 @@ class DiscordAdapter(BasePlatformAdapter):
             self._release_platform_lock()
             return False
 
+    def _log_ingress_drop(self, message: Any, reason: str) -> None:
+        """Record why an inbound Discord message was not dispatched.
+
+        Every rejection branch in the ingress path used to return silently.
+        When a message went missing there was literally nothing to grep: no
+        ``inbound message`` line (that is logged much later), no warning, no
+        error -- so diagnosing a drop meant patching in instrumentation and
+        waiting for it to happen again.
+
+        Level is chosen by who sent it. A drop for an allow-listed human is
+        the "my message vanished" case and goes to INFO so it is in agent.log
+        by default. Everything else -- other bots, unrelated users, channels
+        this profile does not own -- is routine and would be constant noise,
+        so it stays at DEBUG. INFO (not WARNING) is deliberate: WARNING lines
+        are relayed to the Discord alerts channel.
+        """
+        try:
+            author = getattr(message, "author", None)
+            author_id = str(getattr(author, "id", "") or "")
+            allowed = getattr(self, "_allowed_user_ids", set()) or set()
+            noteworthy = (
+                not bool(getattr(author, "bot", False))
+                and ("*" in allowed or author_id in allowed)
+            )
+            logger.log(
+                logging.INFO if noteworthy else logging.DEBUG,
+                "[%s] ingress drop (%s): channel=%s author=%s msg=%s",
+                self.name,
+                reason,
+                getattr(getattr(message, "channel", None), "id", "?"),
+                author_id or "?",
+                getattr(message, "id", "?"),
+            )
+        except Exception:  # pragma: no cover - logging must never break ingress
+            pass
+
     def _discord_message_admission(
         self,
         message: Any,
@@ -1298,25 +1334,33 @@ class DiscordAdapter(BasePlatformAdapter):
         message_id = str(getattr(message, "id", ""))
         if claim:
             if self._dedup.is_duplicate(message_id):
+                self._log_ingress_drop(message, "duplicate message id")
                 return False, False
         elif self._dedup.contains(message_id):
+            self._log_ingress_drop(message, "already seen (dedup cache)")
             return False, False
         if message.author == self._client.user:
             return False, False
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
+            self._log_ingress_drop(
+                message, f"unsupported message type {getattr(message.type, 'name', message.type)!r}",
+            )
             return False, False
 
         role_authorized = False
         if getattr(message.author, "bot", False):
             allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
             if allow_bots == "none":
+                self._log_ingress_drop(message, "bot author, DISCORD_ALLOW_BOTS=none")
                 return False, False
             if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
+                self._log_ingress_drop(message, "bot author without explicit mention")
                 return False, False
             if (
                 self._discord_bots_require_inline_mention()
                 and not self._self_is_raw_mentioned(message)
             ):
+                self._log_ingress_drop(message, "bot author without inline raw mention")
                 return False, False
         else:
             msg_guild = getattr(message, "guild", None)
@@ -1334,6 +1378,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 is_dm=is_dm,
                 channel_ids=msg_channel_ids,
             ):
+                self._log_ingress_drop(message, "author not in allowed users/roles")
                 self._warn_if_fail_closed_default()
                 return False, False
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
@@ -1347,6 +1392,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 for mentioned in message.mentions
             )
             if other_bots_mentioned and not raw_self_mention:
+                self._log_ingress_drop(
+                    message, "another bot was @mentioned and this bot was not",
+                )
                 return False, False
             ignore_no_mention = os.getenv(
                 "DISCORD_IGNORE_NO_MENTION", "true"
@@ -1358,6 +1406,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 free_channels = self._discord_free_response_channels()
                 channel_keys = self._discord_channel_keys(message, parent_id)
                 if "*" not in free_channels and not (channel_keys & free_channels):
+                    self._log_ingress_drop(
+                        message,
+                        "mentions present but bot not mentioned, and channel is "
+                        "not free-response",
+                    )
                     return False, False
 
         return True, role_authorized
@@ -4354,6 +4407,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 if isinstance(chan_obj, discord.Thread)
                 else None,
             )
+            # interaction.channel is frequently None or id-less (the gateway
+            # payload always carries channel_id, but the resolved object
+            # depends on the client cache). channel_keys would then come back
+            # EMPTY while channel_ids -- derived from interaction.channel_id
+            # just above -- holds the real id, and every membership test below
+            # would fail: an allow-listed channel got rejected with
+            # "channel not in DISCORD_ALLOWED_CHANNELS". Union the ids in so
+            # the id form is always testable; name forms still come from
+            # chan_obj when it resolved.
+            channel_keys |= channel_ids
 
             allowed_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
             if allowed_raw:
@@ -7200,14 +7263,16 @@ class DiscordAdapter(BasePlatformAdapter):
             if allowed_channels_raw:
                 allowed_channels = {ch.strip() for ch in allowed_channels_raw.split(",") if ch.strip()}
                 if "*" not in allowed_channels and not (channel_keys & allowed_channels):
-                    logger.debug("[%s] Ignoring message in non-allowed channel: %s", self.name, channel_keys)
+                    self._log_ingress_drop(
+                        message, "channel not in DISCORD_ALLOWED_CHANNELS",
+                    )
                     return False
 
             # Check ignored channels - never respond even when mentioned
             ignored_channels_raw = os.getenv("DISCORD_IGNORED_CHANNELS", "")
             ignored_channels = {ch.strip() for ch in ignored_channels_raw.split(",") if ch.strip()}
             if "*" in ignored_channels or (channel_keys & ignored_channels):
-                logger.debug("[%s] Ignoring message in ignored channel: %s", self.name, channel_keys)
+                self._log_ingress_drop(message, "channel in DISCORD_IGNORED_CHANNELS")
                 return False
 
             free_channels = self._discord_free_response_channels()
@@ -7237,6 +7302,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
             if require_mention and not is_free_channel and not in_bot_thread:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
+                    self._log_ingress_drop(
+                        message, "mention required and bot was not mentioned",
+                    )
                     return False
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
