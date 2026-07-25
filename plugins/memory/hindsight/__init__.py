@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
 import importlib
 import json
 import logging
@@ -49,6 +50,65 @@ from tools.registry import tool_error
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _preserved_process_env(what: str):
+    """Restore ``os.environ`` after importing a third-party module.
+
+    ``hindsight_api.config`` calls
+    ``load_dotenv(find_dotenv(usecwd=True), override=True)`` at module scope,
+    and ``from hindsight import HindsightEmbedded`` imports it transitively.
+    ``find_dotenv`` walks up from the process cwd, so in a Hermes gateway it
+    resolves to the *default* profile's ``~/.hermes/.env`` regardless of which
+    profile is running -- and ``override=True`` then replaces variables this
+    process already loaded from its own ``$HERMES_HOME/.env``.
+
+    The damage is not limited to Hindsight's own settings: the file is a full
+    profile env, so ``DISCORD_BOT_TOKEN``, ``DISCORD_ALLOWED_CHANNELS``,
+    ``DISCORD_FREE_RESPONSE_CHANNELS``, ``DISCORD_HOME_CHANNEL``,
+    ``MATRIX_USER_ID`` and ``MATRIX_ACCESS_TOKEN`` all flip to the default
+    profile's values. Memory initializes lazily on the first turn that uses
+    it, so the symptom is a non-default profile that answers one message and
+    then goes permanently silent mid-conversation: every later message is
+    dropped by the channel allow-list, which now belongs to another bot.
+
+    Hindsight reads what it needs while the module body runs; snapshotting and
+    restoring around the import leaves Hindsight configured and leaves Hermes'
+    env exactly as Hermes built it.
+    """
+    snapshot = dict(os.environ)
+    try:
+        yield
+    finally:
+        clobbered = sorted(
+            k for k in set(snapshot) | set(os.environ)
+            if snapshot.get(k) != os.environ.get(k)
+        )
+        if clobbered:
+            os.environ.clear()
+            os.environ.update(snapshot)
+            # INFO, not WARNING: this is expected with current Hindsight
+            # releases and fires at most once per process, but the key list
+            # is worth having in the log if a profile ever misbehaves again.
+            logger.info(
+                "Importing %s rewrote %d process env var(s) from a foreign "
+                ".env; restored Hermes' own values (%s)",
+                what, len(clobbered), ", ".join(clobbered),
+            )
+
+def _import_hindsight_embedded():
+    """Import ``HindsightEmbedded`` without inheriting its env side effects.
+
+    Kept as its own function so the isolation seam is directly testable and so
+    every future caller gets the guard by construction rather than by
+    remembering to wrap the import.
+    """
+    with _preserved_process_env("hindsight (embedded runtime)"):
+        from hindsight import HindsightEmbedded
+    return HindsightEmbedded
+
+
 
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
@@ -1026,7 +1086,10 @@ class HindsightMemoryProvider(MemoryProvider):
                     pass
                 except Exception as _e:
                     raise ImportError(str(_e))
-                from hindsight import HindsightEmbedded
+                # Guarded: this import runs load_dotenv(override=True)
+                # against whatever .env sits above the cwd, which is the
+                # default profile's, not ours. See _preserved_process_env.
+                HindsightEmbedded = _import_hindsight_embedded()
                 HindsightEmbedded.__del__ = lambda self: None
                 llm_provider = self._config.get("llm_provider", "")
                 if llm_provider in {"openai_compatible", "openrouter"}:
