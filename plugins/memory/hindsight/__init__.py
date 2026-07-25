@@ -97,6 +97,19 @@ def _preserved_process_env(what: str):
                 what, len(clobbered), ", ".join(clobbered),
             )
 
+def _import_guarded(module_name: str):
+    """``importlib.import_module`` with the process env protected.
+
+    EVERY hindsight import in this module must go through here. The env damage
+    happens on the *first* import of ``hindsight_api.config`` anywhere in the
+    process, so guarding only the obvious call site is not enough: whichever
+    path imports it first wins, and the later guarded import sees the module
+    already in ``sys.modules`` and has nothing left to restore.
+    """
+    with _preserved_process_env(module_name):
+        return importlib.import_module(module_name)
+
+
 def _import_hindsight_embedded():
     """Import ``HindsightEmbedded`` without inheriting its env side effects.
 
@@ -104,9 +117,7 @@ def _import_hindsight_embedded():
     every future caller gets the guard by construction rather than by
     remembering to wrap the import.
     """
-    with _preserved_process_env("hindsight (embedded runtime)"):
-        from hindsight import HindsightEmbedded
-    return HindsightEmbedded
+    return _import_guarded("hindsight").HindsightEmbedded
 
 
 
@@ -193,8 +204,10 @@ def _check_local_runtime() -> tuple[bool, str | None]:
     a broken local memory backend.
     """
     try:
-        importlib.import_module("hindsight")
-        importlib.import_module("hindsight_embed.daemon_embed_manager")
+        # Guarded: this probe is what imports hindsight_api.config first in a
+        # live gateway, so it is where the env would otherwise be rewritten.
+        _import_guarded("hindsight")
+        _import_guarded("hindsight_embed.daemon_embed_manager")
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -1115,7 +1128,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._client = HindsightEmbedded(**kwargs)
             else:
                 _ensure_cloud_client_dependency()
-                from hindsight_client import Hindsight
+                Hindsight = _import_guarded("hindsight_client").Hindsight
                 timeout = self._timeout or _DEFAULT_TIMEOUT
                 kwargs = {"base_url": self._api_url, "timeout": float(timeout)}
                 if self._api_key:
@@ -1471,7 +1484,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     # Redirect the daemon manager's Rich console to our log file
                     # instead of stderr. This avoids global fd redirects that
                     # would capture output from other threads.
-                    import hindsight_embed.daemon_embed_manager as dem
+                    dem = _import_guarded("hindsight_embed.daemon_embed_manager")
                     from rich.console import Console
                     dem.console = Console(file=open(log_path, "a", encoding="utf-8"), force_terminal=False)
 

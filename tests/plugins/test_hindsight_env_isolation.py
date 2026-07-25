@@ -4,12 +4,11 @@
 
     load_dotenv(find_dotenv(usecwd=True), override=True)
 
-and ``from hindsight import HindsightEmbedded`` pulls it in transitively.
-``find_dotenv`` walks up from the *process cwd*, which for a Hermes gateway is
-the hermes-agent checkout — so it resolves to the default profile's
-``~/.hermes/.env`` no matter which profile is running, and ``override=True``
-then replaces variables the process already loaded from its own
-``$HERMES_HOME/.env``.
+and every ``hindsight`` package pulls it in transitively. ``find_dotenv`` walks
+up from the *process cwd*, which for a Hermes gateway is the hermes-agent
+checkout — so it resolves to the default profile's ``~/.hermes/.env`` no matter
+which profile is running, and ``override=True`` then replaces variables the
+process already loaded from its own ``$HERMES_HOME/.env``.
 
 That is not confined to Hindsight's own settings: a profile ``.env`` also holds
 ``DISCORD_BOT_TOKEN``, ``DISCORD_ALLOWED_CHANNELS``,
@@ -17,16 +16,59 @@ That is not confined to Hindsight's own settings: a profile ``.env`` also holds
 initializes lazily, on the first turn that uses it, so a non-default profile
 answers exactly one message and then goes permanently silent: every later
 message is dropped by a channel allow-list that now belongs to another bot.
+
+The damage lands on the *first* import anywhere in the process, so every import
+site has to be guarded — guarding only the obvious one leaves whichever path
+runs first free to do the damage, and the guarded call then finds the module
+already in ``sys.modules`` and nothing left to restore. That is exactly how the
+first attempt at this fix failed in production: ``_check_local_runtime()`` runs
+before ``initialize()`` reaches its import.
 """
 
 import importlib
 import os
-import sys
 import types
 
 import pytest
 
 hindsight = importlib.import_module("plugins.memory.hindsight")
+
+
+@pytest.fixture
+def clobbering_import(monkeypatch):
+    """Replace importlib.import_module with one that rewrites the env.
+
+    Stands in for the real packages: the env damage happens while the module
+    body executes, i.e. inside ``import_module`` itself.
+    """
+    calls = []
+
+    def fake_import_module(name):
+        calls.append(name)
+        os.environ["DISCORD_BOT_TOKEN"] = "default-profile-token"
+        os.environ["DISCORD_ALLOWED_CHANNELS"] = "111,222"
+        os.environ["HINDSIGHT_LEAKED_KEY"] = "from-foreign-dotenv"
+        module = types.ModuleType(name)
+        module.HindsightEmbedded = type("HindsightEmbedded", (), {})
+        module.Hindsight = type("Hindsight", (), {})
+        return module
+
+    monkeypatch.setattr(hindsight.importlib, "import_module", fake_import_module)
+    return calls
+
+
+@pytest.fixture
+def profile_env(monkeypatch):
+    """A non-default profile's own environment."""
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "oracle-token")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "999")
+    monkeypatch.delenv("HINDSIGHT_LEAKED_KEY", raising=False)
+
+
+def _assert_profile_env_intact():
+    assert os.environ["DISCORD_BOT_TOKEN"] == "oracle-token"
+    assert os.environ["DISCORD_ALLOWED_CHANNELS"] == "999"
+    assert "HINDSIGHT_LEAKED_KEY" not in os.environ
 
 
 class TestPreservedProcessEnv:
@@ -74,44 +116,39 @@ class TestPreservedProcessEnv:
         )
 
 
-class TestImportHindsightEmbedded:
-    """The real seam: ``from hindsight import HindsightEmbedded`` is guarded."""
+class TestImportGuarded:
+    def test_returns_the_module(self, clobbering_import, profile_env):
+        module = hindsight._import_guarded("hindsight")
+        assert module.__name__ == "hindsight"
 
-    @staticmethod
-    def _install_env_clobbering_hindsight(monkeypatch):
-        """Stand in for the real package, reproducing its import side effect.
+    def test_does_not_leak_the_foreign_env(self, clobbering_import, profile_env):
+        hindsight._import_guarded("hindsight")
+        _assert_profile_env_intact()
 
-        A module-level ``__getattr__`` (PEP 562) fires on the ``from ... import``
-        lookup, which is the same point in the guarded block where the real
-        package's ``load_dotenv(override=True)`` runs.
-        """
 
-        module = types.ModuleType("hindsight")
+class TestEveryImportSiteIsGuarded:
+    """Each production entry point that pulls in a hindsight package."""
 
-        class HindsightEmbedded:
-            pass
+    def test_check_local_runtime(self, clobbering_import, profile_env):
+        # This is the one that regressed: it runs *before* initialize() reaches
+        # its own import, so leaving it unguarded made every later guard a no-op.
+        assert hindsight._check_local_runtime() == (True, None)
+        assert clobbering_import == [
+            "hindsight",
+            "hindsight_embed.daemon_embed_manager",
+        ]
+        _assert_profile_env_intact()
 
-        def __getattr__(name):
-            if name != "HindsightEmbedded":
-                raise AttributeError(name)
-            os.environ["DISCORD_BOT_TOKEN"] = "default-profile-token"
-            os.environ["DISCORD_ALLOWED_CHANNELS"] = "111,222"
-            return HindsightEmbedded
+    def test_check_local_runtime_still_reports_failure(self, monkeypatch, profile_env):
+        def boom(name):
+            raise RuntimeError("numpy exploded")
 
-        module.__getattr__ = __getattr__
-        monkeypatch.setitem(sys.modules, "hindsight", module)
-        return HindsightEmbedded
+        monkeypatch.setattr(hindsight.importlib, "import_module", boom)
+        available, reason = hindsight._check_local_runtime()
+        assert available is False
+        assert "numpy exploded" in reason
+        _assert_profile_env_intact()
 
-    def test_returns_the_class(self, monkeypatch):
-        expected = self._install_env_clobbering_hindsight(monkeypatch)
-        assert hindsight._import_hindsight_embedded() is expected
-
-    def test_import_does_not_leak_the_foreign_env(self, monkeypatch):
-        self._install_env_clobbering_hindsight(monkeypatch)
-        monkeypatch.setenv("DISCORD_BOT_TOKEN", "oracle-token")
-        monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "999")
-
-        hindsight._import_hindsight_embedded()
-
-        assert os.environ["DISCORD_BOT_TOKEN"] == "oracle-token"
-        assert os.environ["DISCORD_ALLOWED_CHANNELS"] == "999"
+    def test_import_hindsight_embedded(self, clobbering_import, profile_env):
+        assert hindsight._import_hindsight_embedded().__name__ == "HindsightEmbedded"
+        _assert_profile_env_intact()
