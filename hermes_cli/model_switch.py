@@ -1157,22 +1157,26 @@ def switch_model(
     else:
         try:
             from hermes_cli.config import read_raw_config
+            from hermes_cli.inventory import raw_config_has_enabled_moa_preset
             from hermes_cli.moa_config import exact_moa_preset_name, normalize_moa_config
 
-            # [hermes-local] Only treat MoA presets the USER wrote into their raw
-            # config.yaml as /model switch targets. load_config() merges
-            # DEFAULT_CONFIG, which ships a preset literally named "default" --
-            # so "/model default" (a user plainly asking for their default
-            # model) silently switched the session into MoA mode. That is how
-            # Neo's 2026-07-23 session ended up acting as provider=moa. Mirrors
-            # inventory._raw_config_has_enabled_moa_preset's raw-config gating.
-            _raw_moa = (read_raw_config() or {}).get("moa")
+            # Only presets the user wrote into their own config.yaml are
+            # /model switch targets. DEFAULT_CONFIG ships an enabled preset
+            # literally named "default", and ``load_config()`` merges it in —
+            # so on a stock install "/model default", a user plainly asking
+            # for their default model, silently switched the session into MoA
+            # mode. ``inventory.raw_config_has_enabled_moa_preset()`` already
+            # draws exactly this line for the model pickers.
+            #
+            # The gate is load-bearing: reading from ``read_raw_config()``
+            # alone would not be enough, because ``normalize_moa_config({})``
+            # synthesizes a "default" preset for an empty config.
             _moa_match = None
-            if isinstance(_raw_moa, dict) and (
-                _raw_moa.get("presets")
-                or any(k in _raw_moa for k in ("reference_models", "aggregator"))
-            ):
-                _moa_cfg = normalize_moa_config(_raw_moa)
+            if raw_config_has_enabled_moa_preset():
+                _raw_moa = (read_raw_config() or {}).get("moa")
+                _moa_cfg = normalize_moa_config(
+                    _raw_moa if isinstance(_raw_moa, dict) else {},
+                )
                 _moa_match = exact_moa_preset_name(_moa_cfg, raw_input)
             if _moa_match:
                 target_provider = "moa"
