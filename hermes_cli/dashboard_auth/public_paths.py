@@ -37,6 +37,10 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # liveness probe in
     # ``docs/agent-dashboard-public-url-contract.md`` (NAS side).
     "/api/status",
+    # Lightweight process-liveness probe (upstream ccab46ca4 / PR #71104
+    # desktop boot readiness). Credential-free 200 so a release-pinned
+    # backend does not 401 the desktop readiness probe into a boot loop.
+    "/api/health",
     # Read-only config-defaults / schema feeds for the SPA's Config page.
     "/api/config/defaults",
     "/api/config/schema",
