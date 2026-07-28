@@ -35,6 +35,18 @@ _HINT_FILENAMES = [
 # Maximum chars per hint file to prevent context bloat
 _MAX_HINT_CHARS = 8_000
 
+# Maximum cumulative hint chars injected in a single agent session.
+# Per-file caps alone don't bound a session that touches many repos/
+# subdirectories in a short span (e.g. a deep-dive into 3-4 different
+# codebases) — each new directory is a fresh 8K injection with no
+# session-wide ceiling, which can dump tens of thousands of tokens
+# directly into the protected fresh tail where compression can't
+# reach it. This budget caps total injected hint content per session;
+# once exhausted, directories are still marked visited (no repeat
+# scanning) but no further hint text is emitted, with one terminal
+# notice so the model knows hints were suppressed rather than absent.
+_MAX_SESSION_HINT_CHARS = 24_000
+
 # Tool argument keys that typically contain file paths
 _PATH_ARG_KEYS = {"path", "file_path", "workdir"}
 
@@ -72,6 +84,8 @@ class SubdirectoryHintTracker:
         self._loaded_dirs: Set[Path] = set()
         # Pre-mark the working dir as loaded (startup context handles it)
         self._loaded_dirs.add(self.working_dir)
+        self._session_hint_chars = 0
+        self._budget_exhausted_notice_sent = False
 
     def check_tool_call(
         self,
@@ -199,6 +213,11 @@ class SubdirectoryHintTracker:
         """Load hint files from a directory. Returns formatted text or None.
 
         Only loads hints from directories within the working directory tree.
+        Enforces a cumulative session-wide char budget (_MAX_SESSION_HINT_CHARS)
+        so a session that touches many repos/subdirectories in quick succession
+        can't stack an unbounded amount of uncompressible content into the
+        protected fresh tail. The directory is still marked visited even when
+        the budget is exhausted, so we don't re-scan it every subsequent call.
         """
         self._loaded_dirs.add(directory)
 
@@ -217,6 +236,22 @@ class SubdirectoryHintTracker:
                     directory, self.working_dir,
                 )
                 return None
+
+        if self._session_hint_chars >= _MAX_SESSION_HINT_CHARS:
+            if not self._budget_exhausted_notice_sent:
+                self._budget_exhausted_notice_sent = True
+                logger.debug(
+                    "Session hint budget (%d chars) exhausted — suppressing "
+                    "further subdirectory hint injections this session",
+                    _MAX_SESSION_HINT_CHARS,
+                )
+                return (
+                    "[Subdirectory context: further AGENTS.md/CLAUDE.md hint "
+                    f"injections suppressed for this session — cumulative "
+                    f"session hint budget of {_MAX_SESSION_HINT_CHARS:,} chars "
+                    "exhausted. Read project doc files directly if you need them.]"
+                )
+            return None
 
         found_hints = []
         for filename in _HINT_FILENAMES:
@@ -237,6 +272,17 @@ class SubdirectoryHintTracker:
                         content[:_MAX_HINT_CHARS]
                         + f"\n\n[...truncated {filename}: {len(content):,} chars total]"
                     )
+                # Enforce remaining session budget on top of the per-file cap.
+                # Reserve room for the truncation marker itself so the total
+                # never overshoots _MAX_SESSION_HINT_CHARS.
+                remaining = _MAX_SESSION_HINT_CHARS - self._session_hint_chars
+                if remaining <= 0:
+                    break
+                if len(content) > remaining:
+                    marker = f"\n\n[...truncated {filename}: session cap]"
+                    keep = max(0, remaining - len(marker))
+                    content = content[:keep] + marker
+                    content = content[:remaining]
                 # Best-effort relative path for display
                 rel_path = str(hint_path)
                 try:
@@ -248,6 +294,7 @@ class SubdirectoryHintTracker:
                     except (ValueError, RuntimeError):
                         pass  # keep absolute
                 found_hints.append((rel_path, content))
+                self._session_hint_chars += len(content)
                 # First match wins per directory (like startup loading)
                 break
             except Exception as exc:

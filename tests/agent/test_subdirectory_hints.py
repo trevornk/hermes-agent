@@ -325,3 +325,95 @@ class TestOutsideWorkspaceRejection:
         outside.mkdir(exist_ok=True)
         tracker = SubdirectoryHintTracker(working_dir=str(project))
         assert tracker._is_valid_subdir(outside) is False
+
+
+class TestSessionHintBudget:
+    """Tests for the cumulative session-wide hint injection budget.
+
+    Regression coverage: without a session-wide cap, a session that visits
+    many distinct subdirectories/repos in quick succession (e.g. a deep
+    multi-repo source dive) stacks unbounded AGENTS.md/CLAUDE.md content
+    into tool results that land in the protected fresh tail, where the
+    compressor can't touch them — this can spike a single turn's context
+    by tens of thousands of tokens and trigger "Cannot compress further".
+    """
+
+    def test_budget_caps_cumulative_injection(self, tmp_path):
+        """Many large hint files across many dirs must not exceed the session budget."""
+        import agent.subdirectory_hints as sh_mod
+
+        root = tmp_path
+        (root / "AGENTS.md").write_text("root")  # pre-loaded, no injection
+
+        # Create far more hint content than the session budget allows.
+        n_dirs = 10
+        per_file_chars = 5_000
+        for i in range(n_dirs):
+            d = root / f"repo{i}"
+            d.mkdir()
+            (d / "AGENTS.md").write_text("X" * per_file_chars)
+
+        tracker = SubdirectoryHintTracker(working_dir=str(root))
+        total_injected = 0
+        for i in range(n_dirs):
+            result = tracker.check_tool_call(
+                "read_file", {"path": str(root / f"repo{i}" / "main.py")}
+            )
+            if result:
+                total_injected += len(result)
+
+        # Cumulative injected content must never exceed the session budget
+        # by more than a small fixed overhead (notice text, headers).
+        assert tracker._session_hint_chars <= sh_mod._MAX_SESSION_HINT_CHARS
+        # Confirm the budget was actually exercised (test is not vacuous):
+        # 10 dirs * 5000 chars > budget, so truncation/suppression must occur.
+        assert (n_dirs * per_file_chars) > sh_mod._MAX_SESSION_HINT_CHARS
+        assert total_injected < (n_dirs * per_file_chars)
+
+    def test_budget_exhausted_notice_sent_once(self, tmp_path):
+        """A single suppression notice should fire, not one per subsequent directory."""
+        import agent.subdirectory_hints as sh_mod
+
+        root = tmp_path
+        (root / "AGENTS.md").write_text("root")
+
+        n_dirs = 8
+        for i in range(n_dirs):
+            d = root / f"repo{i}"
+            d.mkdir()
+            (d / "AGENTS.md").write_text("Y" * 5_000)
+
+        tracker = SubdirectoryHintTracker(working_dir=str(root))
+        notice_count = 0
+        for i in range(n_dirs):
+            result = tracker.check_tool_call(
+                "read_file", {"path": str(root / f"repo{i}" / "main.py")}
+            )
+            if result and "exhausted" in result:
+                notice_count += 1
+
+        assert notice_count == 1
+
+    def test_directories_still_marked_visited_after_budget_exhausted(self, tmp_path):
+        """Even once the budget is exhausted, visited dirs shouldn't be rescanned."""
+        root = tmp_path
+        (root / "AGENTS.md").write_text("root")
+
+        big = root / "big"
+        big.mkdir()
+        (big / "AGENTS.md").write_text("Z" * 5_000)
+
+        tracker = SubdirectoryHintTracker(working_dir=str(root))
+        tracker._session_hint_chars = 999_999  # force budget exhaustion
+
+        tracker.check_tool_call("read_file", {"path": str(big / "main.py")})
+        assert big in tracker._loaded_dirs
+
+    def test_under_budget_behaves_as_before(self, project):
+        """When well under budget, hint injection is unaffected (no regression)."""
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        result = tracker.check_tool_call(
+            "read_file", {"path": str(project / "backend" / "src" / "main.py")}
+        )
+        assert result is not None
+        assert "Backend-specific instructions" in result
