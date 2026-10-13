@@ -287,6 +287,12 @@ def register(ctx):
 
 Only one engine can be registered. A second plugin attempting to register is rejected with a warning.
 
+If the plugin's load fails at startup (its `register()` raises, or import + `register()` overrun
+`plugins.load_timeout_seconds`), the engine is not lost for the life of the process: the next agent
+build that selects it retries the load, on a backoff from 30s up to 10 minutes while it keeps
+failing, and logs `Re-arming failed context-engine plugin load` at INFO. Until a retry succeeds
+each agent falls back to the built-in compressor with the usual `Context engine 'X' not found` warning.
+
 The registered instance is shared process-wide, but every `AIAgent` (parent, subagents, gateway
 sessions) needs its own engine so a child's `update_model()` cannot mutate the parent's budget.
 Hermes therefore calls `engine.clone_for_agent()` on the registered instance at each agent init.
