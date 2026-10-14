@@ -9,6 +9,7 @@ import inspect
 import json
 import logging
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
@@ -712,6 +713,7 @@ def _complete_logical(
     lease = turn.lease
     if not isinstance(lease.host, relay_runtime.RelayRuntime):
         return
+    ended_at = datetime.now(UTC)
     output = {"outcome": outcome}
     if model_name is not None and provider_name is not None:
         output.update({"model": model_name, "provider": provider_name})
@@ -741,8 +743,9 @@ def _complete_logical(
             return
         if popped is False:
             # A call running beside the turn (title generation) finishes under the turn's own
-            # live scopes; keep its result so the drain reports it instead of an orphan.
-            lease.host.defer_scope_output(handle, output)
+            # live scopes; keep its result and end time so the drain closes it as it ended
+            # instead of as an orphan stamped with the drain's clock.
+            lease.host.defer_scope_output(handle, output, ended_at=ended_at)
             logger.debug(
                 "Left logical LLM scope %s under a concurrent scope; the drain closes it with its result",
                 request_id,
