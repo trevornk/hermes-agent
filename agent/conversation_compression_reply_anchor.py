@@ -47,7 +47,7 @@ def _ensure_compressed_keeps_last_assistant_reply(
     from agent.context_compressor import (
         _DB_PERSISTED_MARKER, _fresh_compaction_message_copy, is_compaction_summary_message,
     )
-    from agent.conversation_compression import _message_text
+    from agent.conversation_compression import _is_real_user_message, _message_text
 
     reply, reply_text = None, ""
     for message in reversed(original_messages):
@@ -104,11 +104,23 @@ def _ensure_compressed_keeps_last_assistant_reply(
     # a busy steer), so the pair would reach the durable active set and the pre-call belt
     # would then merge the reply INTO the tool-call row, diverging live from DB.
     if any(isinstance(m, dict) and m.get("role") == "assistant" for m in neighbours):
-        logger.warning(
-            "Compression: engine folded away the just-delivered assistant reply and left a non-matching "
-            "assistant row at its slot; not reinserting it to keep strict role alternation (session=%s).",
-            session_id or "none",
-        )
+        # A real user turn after the reply means the user is no longer reading it: this is a
+        # PREVIOUS turn's final answer that a mid-turn (tool-loop) compaction pushed out of the
+        # engine's tail, and the skip is the designed outcome (the row stays readable on disk).
+        # Only the reply with nothing after it is genuinely "just delivered", and a surviving
+        # non-matching assistant row there is worth an operator's attention.
+        if any(_is_real_user_message(m) for m in original_messages[reply_pos + 1:]):
+            logger.info(
+                "Compression: engine folded away a previous turn's assistant reply and its slot is "
+                "assistant-adjacent; not reinserting it to keep strict role alternation (session=%s).",
+                session_id or "none",
+            )
+        else:
+            logger.warning(
+                "Compression: engine folded away the just-delivered assistant reply and left a non-matching "
+                "assistant row at its slot; not reinserting it to keep strict role alternation (session=%s).",
+                session_id or "none",
+            )
         return None
     # The built-in compressor deliberately lets a reply that alone dominates the window fold
     # (``_ensure_last_assistant_message_in_tail`` yields to ``head_end + 1``) so compaction can
