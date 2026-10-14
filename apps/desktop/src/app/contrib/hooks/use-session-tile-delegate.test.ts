@@ -111,6 +111,7 @@ describe('useSessionTileDelegate resumeTile', () => {
       {
         session_id: 'stored-x',
         cols: 96,
+        source: 'desktop',
         profile: 'ai-engineer',
         omit_messages: true
       },
@@ -139,6 +140,7 @@ describe('useSessionTileDelegate resumeTile', () => {
       {
         session_id: 'stored-y',
         cols: 96,
+        source: 'desktop',
         profile: 'default',
         omit_messages: true
       },
@@ -161,6 +163,7 @@ describe('useSessionTileDelegate resumeTile', () => {
     expect(requestGatewayForAgent).toHaveBeenCalledWith('source-b', 'default', 'session.resume', {
       session_id: 'stored-shared',
       cols: 96,
+      source: 'desktop',
       omit_messages: true,
       profile: 'default'
     })
@@ -190,6 +193,7 @@ describe('useSessionTileDelegate resumeTile', () => {
     expect(requestGatewayForAgent).toHaveBeenCalledWith('barry', 'oxcoder', 'session.resume', {
       session_id: 'stored-remote',
       cols: 96,
+      source: 'desktop',
       omit_messages: true,
       profile: 'backend-oxcoder'
     })
@@ -256,6 +260,7 @@ describe('useSessionTileDelegate resumeTile', () => {
 
     expect(requestGatewayForAgent).toHaveBeenCalledWith('remote-tile', 'tile-profile', 'session.resume', {
       cols: 96,
+      source: 'desktop',
       omit_messages: false,
       profile: 'backend-tile',
       session_id: 'stored-tile'
@@ -574,6 +579,7 @@ describe('useSessionTileDelegate resumeTile', () => {
       {
         session_id: 'stored-b',
         cols: 96,
+        source: 'desktop',
         profile: 'default',
         omit_messages: true
       },

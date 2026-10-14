@@ -434,6 +434,9 @@ export function useSessionTileDelegate({
                 requestForSessionProfile<SessionResumeResult>(owner, requestGateway, 'session.resume', {
                   session_id: storedSessionId,
                   cols: 96,
+                  // The session's client surface travels with the request: a remote/cloud backend has no
+                  // HERMES_DESKTOP, so omitting it labeled this chat `tui` (no MEDIA: delivery guidance).
+                  source: 'desktop',
                   omit_messages: !authoritativeSnapshot,
                   ...(owner ? { profile: typeof owner === 'string' ? owner : owner.profile } : {})
                 }),
