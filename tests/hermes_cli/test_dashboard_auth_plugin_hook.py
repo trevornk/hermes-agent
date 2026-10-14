@@ -190,6 +190,38 @@ def test_profile_manager_cannot_replace_launch_home_auth_provider():
     assert "basic" not in profile_manager._ownership_ledger
 
 
+def test_non_launch_scope_auth_refusal_is_not_a_warning(caplog):
+    """Refusing auth registration from a non-launch scope is routine, not a warning.
+
+    Any process that inspects a sibling profile (e.g. ``hermes --profile X gateway
+    status`` reading another profile's config) builds a manager for that profile
+    and loads the bundled ``basic`` auth plugin into it. The refusal is correct,
+    but it must not surface at WARNING on every such invocation.
+    """
+    import logging
+
+    manager, ctx = _real_ctx()
+    launch_provider = _Basic("launch-home")
+    ctx.register_dashboard_auth_provider(launch_provider)
+
+    profile_scope = hermes_home_key(Path(manager.scope_key) / "profiles" / "bot")
+    profile_ctx = PluginContext(
+        PluginManifest(name="basic", version="0.0.1", kind="backend"),
+        manager=PluginManager(scope_key=profile_scope),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="hermes_cli.plugins"):
+        registration = profile_ctx.register_dashboard_auth_provider(_Basic("profile"))
+
+    # Security property is unchanged: the non-launch scope never registers auth.
+    assert registration is None
+    assert get_provider("basic") is launch_provider
+    # ...but the refusal is expected behaviour, so it is logged below WARNING.
+    refusals = [r for r in caplog.records if "ignoring it because dashboard auth" in r.getMessage()]
+    assert refusals, "refusal should still be logged (at DEBUG)"
+    assert all(r.levelno < logging.WARNING for r in refusals)
+
+
 def test_profile_directory_can_be_the_process_launch_home(monkeypatch, tmp_path):
     """A process launched directly into a profile owns dashboard auth."""
     launch_home = tmp_path / "profiles" / "bot"
