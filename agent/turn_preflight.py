@@ -406,7 +406,11 @@ def compress_after_tool_results(
         # attempts_exhausted lockout when the engine says RUN but the per-turn
         # budget is spent (#101889).
         _block_reason = _blocked_compress_reason(
-            _compressor, _real_tokens, attempts_spent=compression_attempts
+            _compressor, _real_tokens,
+            attempts_spent=(
+                compression_attempts
+                if compression_attempts >= max_compression_attempts else None
+            ),
         )
         if _block_reason:
             agent._warn_context_overflow_blocked(

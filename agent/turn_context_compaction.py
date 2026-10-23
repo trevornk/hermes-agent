@@ -62,7 +62,7 @@ def _recover_overflow_warn_if_measured_below_threshold(
 
 
 def _request_pressure_compaction_eligible(
-    compressor: Any, messages: List[Dict[str, Any]], prompt_tokens: int,
+    compressor: Any, messages: list[dict[str, Any]], prompt_tokens: int,
 ) -> bool:
     """Late-bind the shared policy without creating a module import cycle."""
     from agent.turn_preflight import _request_pressure_compaction_eligible as _eligible
@@ -85,10 +85,10 @@ def _blocked_compress_reason(
     """Why an over-threshold request is blocked (``None`` below threshold or when the
     engine lacks ``should_compress_info`` / raises).
 
-    ``attempts_spent``: when given and the engine says compression SHOULD run
-    (``(True, None)``) yet the caller skipped it, the per-turn attempt budget is
-    spent — name it ``attempts_exhausted:<n>`` instead of dropping the
-    ``(True, None)`` on the floor (silent-lockout case, #101889)."""
+    ``attempts_spent`` is supplied ONLY after the caller verifies its per-turn
+    budget is exhausted. A message-aware policy declining maintenance is not
+    evidence of exhaustion, even when token-only eligibility says ``(True, None)``.
+    Genuine budget lockouts are named ``attempts_exhausted:<n>`` (#101889)."""
     _info = getattr(compressor, "should_compress_info", None)
     if not callable(_info):
         return None

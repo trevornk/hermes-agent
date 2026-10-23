@@ -105,6 +105,12 @@ def _deferred_build_agent_kwargs(current: dict, session_db) -> dict:
     if resume_sid := current.get("resume_session_id"):
         kw["session_id"] = resume_sid
     resume_overrides = current.get("resume_runtime_overrides")
+    if (isinstance(resume_overrides, dict) and resume_overrides
+            and current.get("follow_profile_config") and not current.get("composer_override_profile")):
+        from tui_gateway.fallback_recovery import valid_recovery, recovery_matches_profile
+        state = valid_recovery((resume_overrides.get("model_override") or {}).get("_fallback_recovery"))
+        if not recovery_matches_profile(state, _config_model_target(), _load_cfg()):
+            resume_overrides = None  # profile edited after resume, before deferred construction
     if isinstance(resume_overrides, dict) and resume_overrides and _overrides_have_routable_provider(resume_overrides):
         kw.update(resume_overrides)
     else:
