@@ -806,7 +806,15 @@ class GatewayAdapterLifecycleMixin:
         # Empty-token primary configs can never reconnect; drop them so multiplex setups
         # where a secondary profile owns the bot do not spin forever.
         # See #64674.
-        if not _platform_has_bot_credential(platform, platform_config):
+        # allow_env_fallback=not multiplex: this queue only ever holds PRIMARY-adapter configs
+        # (secondary reconnects go through _secondary_reconnect_attempt's own profile-scoped
+        # check), so under multiplex the primary intentionally has no token and must stay
+        # dropped; without multiplex, a since-rotated/added .env token must revive it rather
+        # than leaving a now-reconnectable config parked until a manual restart (#64674 late
+        # token case).
+        if not _platform_has_bot_credential(
+            platform, platform_config, allow_env_fallback=not self._multiplex_on()
+        ):
             self._drop_from_reconnect_queue(platform, "no bot credential on queued config")
             return
         logger.info("Reconnecting %s (attempt %d)...", platform.value, attempt)

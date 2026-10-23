@@ -1913,9 +1913,27 @@ async def _discover_gateway_mcp_tools(config: object) -> None:
                 logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
 
 
-def _platform_has_bot_credential(platform: "Platform", platform_config: "PlatformConfig") -> bool:
+def _platform_has_bot_credential(
+    platform: "Platform",
+    platform_config: "PlatformConfig",
+    *,
+    allow_env_fallback: bool = False,
+) -> bool:
     """Return True when a token-authenticated platform has a usable bot credential; platforms not using
-    ``PlatformConfig.token`` (Signal session paths, port-binding HTTP adapters) always return True."""
+    ``PlatformConfig.token`` (Signal session paths, port-binding HTTP adapters) always return True.
+
+    ``allow_env_fallback`` additionally backfills ``platform_config.token`` from the platform's
+    process-env token var (``PLATFORM_TOKEN_ENV_NAMES``) when the snapshot itself is still empty.
+    Long-running non-multiplex gateways reload ``.env`` on later turns
+    (``_reload_runtime_env_preserving_config_authority``), so an operator can supply or rotate a
+    token AFTER this ``PlatformConfig`` was queued for reconnect at startup — without the
+    fallback, that config sits in the retry queue forever even though a usable token now exists.
+    Multiplex callers must NEVER set this: under ``multiplex_profiles``, process-global env holds
+    the DEFAULT profile's values, and borrowing it for a secondary profile's queued config would
+    leak the default profile's credential into a profile that never configured one (#86905-shaped
+    risk). Callers pass ``allow_env_fallback=not multiplex_on`` so the primary/non-multiplex path
+    alone gets the late-token backfill.
+    """
     from gateway.config import PLATFORM_TOKEN_ENV_NAMES, Platform
     if platform is Platform.WHATSAPP:
         from hermes_constants import get_hermes_dir
@@ -1937,10 +1955,19 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
     # build_config() already copies all three env vars onto extra, and importing this module loads
     # ~/.hermes/.env, so an env fallback would report "has credential" for every Matrix config on the box —
     # including the empty-primary multiplex case (#64674) this check exists to evict.
-    if platform is not Platform.MATRIX:
+    if platform is Platform.MATRIX:
+        extra = getattr(platform_config, "extra", None) or {}
+        if all(str(extra.get(key) or "").strip() for key in ("homeserver", "user_id", "password")):
+            return True
+    if not allow_env_fallback:
         return False
-    extra = getattr(platform_config, "extra", None) or {}
-    return all(str(extra.get(key) or "").strip() for key in ("homeserver", "user_id", "password"))
+    # Late-resolved token: an operator supplied/rotated the credential in .env after this
+    # PlatformConfig snapshot was queued. Only reached for non-multiplex callers (see docstring).
+    env_token = os.environ.get(PLATFORM_TOKEN_ENV_NAMES[platform], "").strip()
+    if env_token:
+        platform_config.token = env_token
+        return True
+    return False
 
 
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")

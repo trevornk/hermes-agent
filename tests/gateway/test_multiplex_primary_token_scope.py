@@ -329,6 +329,106 @@ class TestPrimaryMessageRuntimeScope:
 
 
 class TestReconnectDropsEmptyToken:
+    def test_backfills_late_resolved_token_from_env(self, monkeypatch):
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+        from gateway.run import _platform_has_bot_credential
+
+        env_name = PLATFORM_TOKEN_ENV_NAMES[Platform.DISCORD]
+        monkeypatch.setenv(env_name, "late-resolved-token")
+        config = PlatformConfig(enabled=True, token="")
+
+        assert _platform_has_bot_credential(
+            Platform.DISCORD, config, allow_env_fallback=True
+        ) is True
+        assert config.token == "late-resolved-token"
+
+    def test_multiplex_path_does_not_borrow_process_global_token(self, monkeypatch):
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+        from gateway.run import _platform_has_bot_credential
+
+        env_name = PLATFORM_TOKEN_ENV_NAMES[Platform.DISCORD]
+        monkeypatch.setenv(env_name, "secondary-profile-token")
+        config = PlatformConfig(enabled=True, token="")
+
+        # Default allow_env_fallback=False mirrors every multiplex call site.
+        assert _platform_has_bot_credential(Platform.DISCORD, config) is False
+        assert config.token == ""
+
+    def test_reconnect_watcher_passes_allow_env_fallback_only_when_not_multiplex(self, monkeypatch):
+        """The queue-drop call site (gateway/run_adapters.py) must gate the fallback on
+        ``self._multiplex_on()`` — this is the actual production wiring, not just the helper."""
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+        from gateway.run_adapters import GatewayAdapterLifecycleMixin
+
+        env_name = PLATFORM_TOKEN_ENV_NAMES[Platform.DISCORD]
+        monkeypatch.setenv(env_name, "rotated-runtime-token")
+
+        drop_reasons = []
+
+        class _FakeRunner(GatewayAdapterLifecycleMixin):
+            def __init__(self, multiplex: bool, platform_config):
+                self._multiplex = multiplex
+                self._failed_platforms = {
+                    Platform.DISCORD: {"config": platform_config, "attempts": 1, "next_retry": 0}
+                }
+
+            def _multiplex_on(self):
+                return self._multiplex
+
+            def _flag_reconnect_needs_attention(self, *a, **k):
+                pass
+
+            def _drop_from_reconnect_queue(self, platform, reason):
+                # Stop right after the credential gate instead of exercising the
+                # real adapter-creation path (out of scope for this unit test).
+                drop_reasons.append(reason)
+                raise _StopAtCredentialGate()
+
+            def _create_adapter(self, *a, **k):
+                # Reached only when the credential gate passed. BaseException (not
+                # Exception) so it isn't swallowed by the method's `except Exception`.
+                raise _StopAtCredentialGate()
+
+        class _StopAtCredentialGate(BaseException):
+            pass
+
+        # Non-multiplex: the late-resolved env token must be found and backfilled onto the
+        # queued config, so the credential gate must NOT drop it for "no bot credential".
+        cfg_nonmux = PlatformConfig(enabled=True, token="")
+        runner = _FakeRunner(multiplex=False, platform_config=cfg_nonmux)
+        import asyncio as _asyncio
+
+        try:
+            _asyncio.run(runner._reconnect_failed_platform(Platform.DISCORD, now=0))
+        except _StopAtCredentialGate:
+            pass
+        assert "no bot credential on queued config" not in drop_reasons
+        assert cfg_nonmux.token == "rotated-runtime-token"
+
+        # Multiplex: must NOT borrow the process-global token; stays dropped, unmutated.
+        drop_reasons.clear()
+        cfg_mux = PlatformConfig(enabled=True, token="")
+        runner_mux = _FakeRunner(multiplex=True, platform_config=cfg_mux)
+        try:
+            _asyncio.run(runner_mux._reconnect_failed_platform(Platform.DISCORD, now=0))
+        except _StopAtCredentialGate:
+            pass
+        assert drop_reasons == ["no bot credential on queued config"]
+        assert cfg_mux.token == ""
+
+    def test_empty_config_and_environment_remains_uncredentialed(self, monkeypatch):
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+        from gateway.run import _platform_has_bot_credential
+
+        env_name = PLATFORM_TOKEN_ENV_NAMES[Platform.DISCORD]
+        monkeypatch.delenv(env_name, raising=False)
+        config = PlatformConfig(enabled=True, token="")
+
+        assert _platform_has_bot_credential(Platform.DISCORD, config) is False
+        assert _platform_has_bot_credential(
+            Platform.DISCORD, config, allow_env_fallback=True
+        ) is False
+
     @pytest.mark.asyncio
     async def test_empty_token_removed_from_queue(self):
         from gateway.run import GatewayRunner, _platform_has_bot_credential
