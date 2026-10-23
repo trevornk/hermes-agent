@@ -1120,9 +1120,26 @@ def _prepare_runtime_status_update(
                 if not isinstance(k, str) or ":" not in k
                 or (drop_prefix is not None and not k.startswith(drop_prefix))
             }
-        payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
+        # Only the gateway runtime may claim the top-level identity. Short-lived CLI
+        # processes (notably `hermes send`) construct adapters that report platform
+        # state through this function; if they stamp their own PID here, the live
+        # gateway is subsequently reported down after the sender exits. The runtime
+        # lock is authoritative for embedded hosts; the argv check covers startup
+        # writes before that lock is acquired.
+        owns_runtime = owns_gateway_runtime_lock() or looks_like_gateway_runtime_command_line(
+            " ".join(str(part) for part in current_record["argv"])
+        )
+        if owns_runtime:
+            payload.update({
+                key: current_record[key]
+                for key in ("kind", "pid", "argv", "start_time", "hermes_home")
+            })
+            payload.update(_get_code_identity_fields())
+        else:
+            # Keep a legacy record recognizable without permitting this transient
+            # process to replace its owner.
+            payload.setdefault("kind", current_record["kind"])
         payload["updated_at"] = _utc_now_iso()
-        payload.update(_get_code_identity_fields())
         _apply_set_fields(payload, (
             ("gateway_state", gateway_state, None), ("exit_reason", exit_reason, None),
             ("restart_requested", restart_requested, bool),
