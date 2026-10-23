@@ -259,12 +259,29 @@ def _plugins_dir() -> Path:
     return plugins
 
 
-def _sanitize_plugin_name(name: str, plugins_dir: Path, *, allow_subdir: bool = False) -> Path:
+def _sanitize_plugin_name(
+    name: str, plugins_dir: Path, *, allow_subdir: bool = False, allow_symlink: bool = False,
+) -> Path:
     """Validate a plugin name and return the safe target path inside *plugins_dir*.
 
     Raises ``ValueError`` on traversal or a target outside the plugins directory. ``allow_subdir``
     permits forward slashes so category keys like ``web/firecrawl`` can be looked up
     (``..`` and backslashes stay rejected); install paths keep ``False`` — a clone lands top-level.
+
+    [carried, plugin_symlink_fix.patch] ``allow_symlink=True`` permits *name* to
+    resolve to a symlink whose target lives outside *plugins_dir*, without
+    rejecting it as an escape. This supports the operator-created pattern of
+    sharing one plugin git checkout across multiple profiles:
+    ``~/.hermes/profiles/<profile>/plugins/<name>`` is a symlink to the shared
+    install at ``~/.hermes/plugins/<name>``. The symlink's *link path* is still
+    validated character-by-character above (no ``..``, no absolute paths, no
+    unexpected subdirs) before we ever look at the filesystem, so this cannot
+    be used to smuggle a traversal through *name* itself — it only widens what
+    an *already-installed, on-disk* entry is allowed to be. Only pass this for
+    operations on an already-installed plugin (update, read) — never for
+    install/create, where a symlink placed at the fresh target location would
+    be a genuine escape vector (redirecting where the clone's files get
+    written).
     """
     if allow_subdir and name:
         name = name.strip("/")
@@ -276,8 +293,13 @@ def _sanitize_plugin_name(name: str, plugins_dir: Path, *, allow_subdir: bool = 
         if bad in name:
             raise ValueError(f"Invalid plugin name '{name}': must not contain '{bad}'.")
 
-    target = (plugins_dir / name).resolve()
     plugins_resolved = plugins_dir.resolve()
+    unresolved_target = plugins_dir / name
+
+    if allow_symlink and unresolved_target.is_symlink():
+        return unresolved_target
+
+    target = unresolved_target.resolve()
     if target == plugins_resolved:
         raise ValueError(f"Invalid plugin name '{name}': resolves to the plugins directory itself.")
     if plugins_resolved not in target.parents:
@@ -446,10 +468,21 @@ def _clone_failure_message(git_url: str, git_error: str) -> str:
             f"Details: {escape(git_error.strip())}")
 
 
-def _require_installed_plugin(name: str, plugins_dir: Path, console) -> Path:
-    """The plugin path if it exists; else exit 1 (invalid name, or a listing of installed plugins)."""
+def _require_installed_plugin(
+    name: str, plugins_dir: Path, console, *, allow_symlink: bool = False
+) -> Path:
+    """The plugin path if it exists; else exit 1 (invalid name, or a listing of installed plugins).
+
+    [carried, plugin_symlink_fix.patch] ``allow_symlink=True`` is for read/update
+    operations on an already-installed plugin, where the entry may legitimately
+    be a symlink into a shared checkout (see ``_sanitize_plugin_name``). Leave it
+    ``False`` (default) for destructive operations like remove, where following a
+    symlink to decide what gets deleted is ambiguous and risky.
+    """
     try:
-        target = _sanitize_plugin_name(name, plugins_dir, allow_subdir=True)
+        target = _sanitize_plugin_name(
+            name, plugins_dir, allow_subdir=True, allow_symlink=allow_symlink
+        )
     except ValueError as e:
         _fail(console, f"[red]Error:[/red] {e}")
     if not target.exists():
@@ -1027,11 +1060,19 @@ def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str,
     return {"ok": True, "name": key, "unchanged": not changed, "restart_required": changed}
 
 
-def _user_installed_plugin_dir(name: str) -> Optional[Path]:
+def _user_installed_plugin_dir(name: str, *, allow_symlink: bool = False) -> Optional[Path]:
     """Resolved path under ``~/.hermes/plugins/<name>`` if it exists, else the user install
-    :func:`_find_plugin_entry` resolves *name* to (its manifest or catalog name)."""
+    :func:`_find_plugin_entry` resolves *name* to (its manifest or catalog name).
+
+    [carried, plugin_symlink_fix.patch] ``allow_symlink=True`` is for read/update
+    callers where the entry may legitimately be a symlink into a shared checkout
+    (see ``_sanitize_plugin_name``). Leave it ``False`` (default) for destructive
+    callers like remove.
+    """
     try:
-        target = _sanitize_plugin_name(name, _plugins_dir(), allow_subdir=True)
+        target = _sanitize_plugin_name(
+            name, _plugins_dir(), allow_subdir=True, allow_symlink=allow_symlink
+        )
     except ValueError:
         return None
     return target if target.is_dir() else _resolved_user_plugin_dir(name)

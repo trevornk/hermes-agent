@@ -133,7 +133,7 @@ def cmd_update(name: str, *, interactive: bool = True, force: bool = False) -> N
     """``hermes plugins update <name> [--force]``: :func:`update_one`, exit 1 on a refusal."""
     from hermes_cli.plugins_cmd_catalog import RepinConsentRequired
     console = _pc()._console()
-    target = _pc()._require_installed_plugin(name, _pc()._plugins_dir(), console)
+    target = _pc()._require_installed_plugin(name, _pc()._plugins_dir(), console, allow_symlink=True)
     try:
         update_one(name, target, console, interactive=interactive, force=force)
     except RepinConsentRequired as exc:
@@ -316,7 +316,7 @@ def dashboard_update_user_plugin(name: str, *, accept_capabilities: bool = False
     from hermes_cli import plugins_cmd_catalog as catalog
     from hermes_cli.plugins_activation import activate_plugin_now
     from hermes_cli.plugins_cmd_install import scan_blocked_result
-    target = _pc()._user_installed_plugin_dir(name)
+    target = _pc()._user_installed_plugin_dir(name, allow_symlink=True)
     if target is None:
         return {"ok": False, "error": f"Plugin '{name}' was not found under {_pc()._plugins_dir()}."}
     sidecar = catalog.catalog_install_record(target)
