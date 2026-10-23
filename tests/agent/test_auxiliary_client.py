@@ -3701,10 +3701,25 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert response.choices[0].message.content == "summary"
 
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+        """The adapter must abort a stream that stays alive past the deadline.
+
+        Asserted by counting events consumed, not solely by wall clock. The
+        stream would keep emitting 50 events; prompt enforcement must stop
+        after only a few. A wall-clock-only budget is a lower bound that can
+        be blown by scheduler jitter alone (``time.sleep`` only guarantees
+        *at least* the requested delay), so ``events_yielded`` gives a
+        deterministic signal that enforcement actually happened, immune to
+        scheduler latency; the wall-clock assertion stays as a secondary,
+        generous sanity bound.
+        """
+        events_yielded = 0
+
         class _SlowAliveCreateStream:
             def __iter__(self):
+                nonlocal events_yielded
                 for _ in range(50):
                     time.sleep(0.03)
+                    events_yielded += 1
                     yield SimpleNamespace(type="response.in_progress")
 
             def close(self): pass
@@ -3723,6 +3738,14 @@ class TestCodexAuxiliaryAdapterTimeout:
                 timeout=0.05,
             )
 
+        # The whole point: it must NOT drain the entire 50-event stream. Each
+        # event is >= the 0.05s deadline in aggregate, so a correct adapter
+        # bails almost immediately; anything that consumes the full stream is
+        # not enforcing the timeout.
+        assert events_yielded < 50, (
+            f"adapter drained the entire stream ({events_yielded} events) "
+            "instead of enforcing the total timeout"
+        )
         # The stream would keep emitting for ~1.5s; the 0.05s total timeout must cut it off.
         assert time.monotonic() - started < 1.0
 
