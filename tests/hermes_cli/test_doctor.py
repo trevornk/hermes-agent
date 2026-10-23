@@ -307,6 +307,25 @@ class TestDoctorToolAvailabilityOverrides:
         assert available == []
         assert unavailable == [kanban_entry]
 
+    # [carried, backend_diagnostics_guards.patch]
+    def test_omits_intentionally_default_off_toolsets(self, monkeypatch):
+        monkeypatch.setattr(doctor_tools, "_is_default_off_toolset", lambda item: item["name"] == "spotify")
+        spotify = {"name": "spotify", "missing_vars": ["SPOTIFY_CLIENT_ID"]}
+        required = {"name": "terminal", "missing_vars": ["SHELL"]}
+
+        available, unavailable = doctor_tools._apply_doctor_tool_availability_overrides(
+            [], [spotify, required]
+        )
+
+        assert available == []
+        assert unavailable == [required]
+
+    def test_is_default_off_toolset_reads_real_default_off_set(self):
+        # Real integration, not a monkeypatched stub: confirms the actual
+        # _DEFAULT_OFF_TOOLSETS set gates real bundled opt-in integrations.
+        assert doctor_tools._is_default_off_toolset({"name": "spotify"}) is True
+        assert doctor_tools._is_default_off_toolset({"name": "terminal"}) is False
+
 
 
 

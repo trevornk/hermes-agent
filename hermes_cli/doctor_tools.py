@@ -103,6 +103,17 @@ def _is_kanban_worker_env_gate(item: dict) -> bool:
             and bool(tools) and all(str(tool).startswith("kanban_") for tool in tools))
 
 
+# [carried, backend_diagnostics_guards.patch]
+def _is_default_off_toolset(item: dict) -> bool:
+    """Return True for bundled integrations that are intentionally opt-in."""
+    try:
+        from hermes_cli.tools_config import _DEFAULT_OFF_TOOLSETS
+
+        return item.get("name") in _DEFAULT_OFF_TOOLSETS
+    except Exception:
+        return False
+
+
 def _doctor_tool_availability_detail(toolset: str) -> str:
     """Optional explanatory suffix for toolsets whose doctor status needs context."""
     if toolset == "kanban" and not os.environ.get("HERMES_KANBAN_TASK"):
@@ -144,10 +155,24 @@ def _apply_doctor_tool_availability_overrides(available: list[str], unavailable:
     """Adjust runtime-gated tool availability for doctor diagnostics."""
     updated_available, updated_unavailable = list(available), []
     for item in unavailable:
-        if not _is_kanban_worker_env_gate(item):
+        if _is_kanban_worker_env_gate(item):
+            if "kanban" not in updated_available:
+                updated_available.append("kanban")
+        elif _is_default_off_toolset(item) and not (
+            item.get("name") == "kanban" and os.environ.get("HERMES_KANBAN_TASK")
+        ):
+            # [carried, backend_diagnostics_guards.patch] Intentionally opt-in
+            # integrations (spotify, discord, homeassistant, ...) are not a
+            # doctor "problem" — omit them from unavailable entirely rather
+            # than surfacing them as available OR unavailable.
+            #
+            # `kanban` is in _DEFAULT_OFF_TOOLSETS too, but inside a kanban
+            # worker (HERMES_KANBAN_TASK set) its unavailability is a REAL
+            # diagnostic state upstream reports, not opt-in noise — suppressing
+            # it there hid a genuine fault. Only suppress the opt-in case.
+            continue
+        else:
             updated_unavailable.append(item)
-        elif "kanban" not in updated_available:
-            updated_available.append("kanban")
     return updated_available, updated_unavailable
 
 
