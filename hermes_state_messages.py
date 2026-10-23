@@ -426,6 +426,46 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         # holding the lock for seconds (VACUUM, checkpoint) can't kill it.
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
+    def append_completion_notice(self, session_id: str, content: str, delivery_id: str) -> int:
+        """Persist one display-only cron completion in a conversation lineage.
+
+        The ``system`` row is intentionally absent from the model projection in
+        :meth:`get_resume_conversations`: it is a durable UI result, not a turn
+        or a mutation of a running agent's in-memory history. Retrying after a
+        consumer crash returns the original row instead of duplicating the notice.
+        """
+        if not delivery_id:
+            raise ValueError("Completion notice requires a stable delivery_id")
+        msg = {
+            "content": content,
+            "display_kind": "cron_completion",
+            "display_metadata": {"delivery_id": delivery_id},
+        }
+        params = self._message_row_params(session_id, "system", msg, None, time.time(), keep_reasoning=False)
+
+        def _do(conn):
+            existing = conn.execute(
+                """WITH RECURSIVE lineage(id) AS (
+                    SELECT ? UNION
+                    SELECT s.parent_session_id FROM sessions s JOIN lineage l ON s.id = l.id
+                    JOIN sessions p ON p.id = s.parent_session_id WHERE p.end_reason = 'compression'
+                ) SELECT m.id FROM messages m JOIN lineage l ON m.session_id = l.id
+                WHERE m.display_kind = 'cron_completion'
+                AND json_extract(m.display_metadata, '$.delivery_id') = ? LIMIT 1""",
+                (session_id, delivery_id),
+            ).fetchone()
+            if existing is not None:
+                return existing[0]
+            # Ordinary appends are safe during compression: the compression
+            # watermark carries concurrent rows forward. This row never enters
+            # the live agent history or the next model prompt.
+            self._check_transcript_write_guards(conn, session_id, None)
+            msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+            self._bump_session_counters(conn, session_id, 1, 0, unit=True)
+            return msg_id
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
     def append_messages_batch(
         self, session_id: str, messages: list[dict[str, Any]], compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None, chunk_rows: Optional[int] = None,
@@ -1550,6 +1590,10 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             self._active_clause(include_inactive, include_compacted), with_session_id=False, with_compacted=display)
         if include_compacted:
             rows = self._dedupe_display_generations(rows, drop_removed=display)
+        # ``repair_alternation`` is the model-replay projection. Cron completion
+        # rows are state.db-backed display markers, never model context.
+        if repair_alternation:
+            rows = [row for row in rows if row["display_kind"] != "cron_completion"]
         return self._rows_to_conversation(rows, session_id=session_id, include_ancestors=include_ancestors,
             repair_alternation=repair_alternation, include_row_ids=include_row_ids,
             include_summary_markers=repair_alternation)
@@ -1703,7 +1747,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         # never LLM input: a resuming surface that fed it to the agent would count it in the history
         # and send a prefix the previous process never sent.
         model_history = self._rows_to_conversation(
-            [r for r in rows if r["session_id"] == session_id and r["active"] and r["role"] != "session_meta"],
+            [r for r in rows if r["session_id"] == session_id and r["active"] and r["role"] != "session_meta"
+             and r["display_kind"] != "cron_completion"],
             session_id=session_id,
             include_ancestors=False, repair_alternation=True, include_row_ids=True, include_summary_markers=True)
         display_history = self._rows_to_conversation(

@@ -3,6 +3,9 @@
 Only gateway/session_bot.py admits execution. Old claimed/terminal records remain
 inspectable; the legacy UI claim consumer is retired. No authority means refusal.
 Receipt storage derives from FalconOrtiz's live-owner mailbox (#101564).
+Completion notices (``kind=completion_notice``) are different: their state.db append
+is idempotent, so their claims are reclaimed, and they are addressed to Bot Chat's
+compression tip rather than a live owner.
 """
 from __future__ import annotations
 
@@ -118,6 +121,29 @@ def _authority_rpc(home, method, params):
         if not rpc_started:
             raise PreDialError(str(exc)) from exc
         raise
+
+
+def find_canonical_bot_chat_target(profile_home: Path | str) -> dict[str, str] | None:
+    """Return Bot Chat's durable compression tip without requiring a live owner.
+
+    Completion notices are addressed to this existing canonical conversation and
+    remain queued while Desktop/TUI is closed. This deliberately never creates
+    a Bot Chat: a missing target is not permission to route an unattended cron
+    result into a newly minted conversation.
+    """
+    from hermes_state import SessionDB
+
+    home = Path(profile_home).resolve()
+    if not (home / "state.db").is_file():
+        return None
+    db = SessionDB(db_path=home / "state.db", read_only=True)
+    try:
+        session_id = db.resolve_session_by_title(db.CANONICAL_BOT_CHAT_TITLE)
+    finally:
+        db.close()
+    if not session_id:
+        return None
+    return {"profile_home": str(home), "session_id": str(session_id)}
 
 
 def _owner(home: Path | str, owner: dict[str, Any]) -> dict[str, str]:
@@ -267,15 +293,25 @@ def _ticket_shape_error(path: Path, record: dict[str, Any]) -> str | None:
     scan and the claim sweep — wedging admission and delivery for the whole
     profile exactly like corrupt JSON did before ``_scan_read`` existed.
     """
-    owner = record.get("owner")
     created_at, sequence = record.get("created_at"), record.get("sequence", record.get("created_at"))
     if record.get("delivery_id") != path.stem or record.get("id") != path.stem:
         return "id does not match filename"
     status = record.get("status")
-    if not isinstance(status, str) or status not in ({"queued", "claimed"} | _TERMINAL):
-        return f"unknown status {status!r}"
     if not all(isinstance(v, int) and not isinstance(v, bool) for v in (created_at, sequence)):
         return "created_at/sequence are not integers"
+    if record.get("kind") == "completion_notice":
+        # A different ticket shape: addressed by ``target`` (Bot Chat's compression
+        # tip), never an ``owner`` lease pin, and its terminal state is ``persisted``.
+        if not isinstance(status, str) or status not in {"queued", "claimed", "persisted"}:
+            return f"unknown completion-notice status {status!r}"
+        target = record.get("target")
+        if not isinstance(target, dict) or not all(
+                isinstance(target.get(k), str) and target[k] for k in ("profile_home", "session_id")):
+            return "completion-notice target is incomplete"
+        return None
+    if not isinstance(status, str) or status not in ({"queued", "claimed"} | _TERMINAL):
+        return f"unknown status {status!r}"
+    owner = record.get("owner")
     if not isinstance(owner, dict) or not all(isinstance(owner.get(k), str) and owner[k] for k in _OWNER_KEYS):
         return "owner pin is incomplete"
     return None
@@ -368,6 +404,44 @@ def _door(call: Callable[[Path, dict], dict], profile_home, owner, message, *, d
         **({"author": dict(author)} if author else {}), **category)), **category}
 
 
+def deliver_completion_notice(
+    profile_home: Path | str, message: str, *, delivery_id: str | None = None,
+) -> dict[str, Any]:
+    """Durably queue a Desktop-visible completion notice without starting a turn.
+
+    The recipient is the pre-existing canonical Bot Chat's compression lineage,
+    not a transient Desktop runtime id. A producer therefore succeeds while no
+    client owns the session; the next eligible Desktop/TUI owner claims it.
+    """
+    if not isinstance(message, str):
+        raise ValueError("message must be a string")
+    target = find_canonical_bot_chat_target(profile_home)
+    if target is None:
+        raise RuntimeError("canonical Bot Chat is unavailable")
+    key = _delivery_id(delivery_id if delivery_id is not None else uuid.uuid4().hex)
+    with _locked(profile_home) as root:
+        path = root / f"{key}.json"
+        existing = _read(path)
+        if existing is not None:
+            if (existing.get("kind") != "completion_notice"
+                    or existing.get("message") != message
+                    or (existing.get("target") or {}).get("profile_home") != target["profile_home"]):
+                raise ValueError("delivery id already belongs to a different payload")
+            return existing
+        record = dict(
+            delivery_id=key,
+            id=key,
+            kind="completion_notice",
+            target=target,
+            message=message,
+            status="queued",
+            created_at=time.time_ns(),
+            sequence=_next_sequence(root),
+        )
+        _write(path, record)
+        return record
+
+
 def owner_holds_delivery(profile_home: Path | str, record: dict) -> bool:
     """Whether the profile authority still holds ``record`` (main's bounded DM wait asks this).
 
@@ -386,6 +460,74 @@ def claim_pending_delivery(profile_home, owner):
     A previously claimed record can still publish its terminal receipt below.
     """
     return
+
+
+def _completion_notice_matches(home: Path | str, record: dict, session_id: str) -> bool:
+    target = record.get("target")
+    if not isinstance(target, dict) or target.get("profile_home") != str(Path(home).resolve()):
+        return False
+    target_session = str(target.get("session_id") or "")
+    if target_session == session_id:
+        return True
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=Path(home) / "state.db", read_only=True)
+    try:
+        return db.get_compression_tip(target_session) == session_id
+    finally:
+        db.close()
+
+
+def claim_pending_completion_notice(profile_home: Path | str, session_id: str) -> dict[str, Any] | None:
+    """Claim or reclaim one canonical Bot Chat completion notice.
+
+    This notification-only binding deliberately does not acquire a turn lease:
+    opening Bot Chat must surface completed cron work even before any prompt.
+    Reclaim is safe because ``SessionDB.append_completion_notice`` dedupes by
+    delivery id inside its transaction.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if not _root(profile_home).is_dir():
+        return None
+    with _locked(profile_home) as root:
+        pending = [
+            record for path in root.glob("*.json")
+            if (record := _scan_read(path)) is not None
+            and record.get("kind") == "completion_notice"
+            and record.get("status") in {"queued", "claimed"}
+            and _completion_notice_matches(profile_home, record, session_id)
+        ]
+        if not pending:
+            return None
+        record = min(pending, key=lambda item: (
+            item.get("sequence", item["created_at"]), item["delivery_id"]))
+        record.update(status="claimed", claimed_at=time.time_ns(), claim_token=uuid.uuid4().hex,
+                      claim_attempts=int(record.get("claim_attempts") or 0) + 1,
+                      claim_session_id=session_id)
+        _write(root / f"{record['delivery_id']}.json", record)
+        return record
+
+
+def complete_completion_notice(
+    profile_home: Path | str, delivery_id: str, claim_token: str,
+) -> dict[str, Any]:
+    """Record durable state.db persistence, never an unprovable renderer ack."""
+    key = _delivery_id(delivery_id)
+    with _locked(profile_home) as root:
+        path = root / f"{key}.json"
+        record = _read(path)
+        if record is None:
+            raise FileNotFoundError(f"delivery not found: {key}")
+        if record.get("kind") != "completion_notice":
+            raise ValueError("delivery is not a completion notice")
+        if record.get("status") == "persisted":
+            return record
+        if record.get("status") != "claimed" or record.get("claim_token") != claim_token:
+            raise RuntimeError("completion notice claim was superseded")
+        record.update(status="persisted", persisted_at=time.time_ns())
+        _write(path, record)
+        return record
 
 
 def complete_delivery(

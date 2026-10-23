@@ -1,5 +1,6 @@
 """Imported turns retain their receipt and cannot bypass the local FIFO."""
 import contextlib
+import logging
 import threading
 from types import SimpleNamespace
 
@@ -82,8 +83,16 @@ def test_viewer_poller_never_discovers_or_claims_bot_execution(monkeypatch, tmp_
     events.put({'type': 'owned-completion'})
     monkeypatch.setattr(process_registry, 'completion_queue', events)
     delivered = []
+    # [carried, cron_no_agent_completion_delivery] the loop also polls display-only cron completion
+    # notices; run the real poll so the assertion below covers that lane too (it claims a notice
+    # record, never an execution).
+    completion_poll = rebind(session_notifications._poll_bot_completion_notice_once, {
+        '_session_home': lambda session: tmp_path, '_emit': lambda *a: None,
+        'logger': logging.getLogger('test'),
+    })
     poll = rebind(session_notifications._notification_poller_scoped_loop, {
-        'time': time, '_LOOP_POLL_SECONDS': 0, '_KANBAN_POLL_SECONDS': 0,
+        'time': time, '_LOOP_POLL_SECONDS': 0, '_KANBAN_POLL_SECONDS': 0, '_BOT_COMPLETION_POLL_SECONDS': 0,
+        '_poll_bot_completion_notice_once': completion_poll,
         '_poll_bot_live_delivery_once': lambda *a: calls.append('legacy-claim'),
         '_maybe_fire_tui_loop_tick': lambda *a: None,
         '_maybe_fire_tui_heartbeat_tick': lambda *a: None,

@@ -744,6 +744,39 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
         run_id = job.get("execution_id")
         if not run_id:
             run_id = job.setdefault("_bot_chat_run_id", uuid.uuid4().hex)
+        if job.get("no_agent"):
+            # Script-only jobs already completed their work. Their Bot Chat result is a
+            # display-only completion notice, not an instruction to begin an unrelated
+            # agent turn. It binds to the existing canonical conversation and remains
+            # durable while no Desktop/TUI owner is live; never fall back to the CLI lane
+            # or the deferred/suppression machinery built for agent-turn deliveries.
+            # Delivered directly (never through bot_chat_message), so scrub here as the
+            # inbound-turn text is: name and output through the same fail-closed policy.
+            job_name = _redact_cron_payload(job.get("name", job_id), "job name")
+            notice_message = (f"Cronjob Response: {job_name}\n\n"
+                              f"{_redact_cron_payload(content, 'bot-chat payload')}")
+            notice_key = hashlib.sha256(json.dumps(
+                ["completion-notice", str(source_home), job_id, str(run_id), str(home)],
+                ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            receipt = read_delivery_result(home, notice_key)
+            if receipt is None:
+                from tools.bot_live_delivery import deliver_completion_notice
+                receipt = deliver_completion_notice(home, notice_message, delivery_id=notice_key)
+            if receipt.get("kind") != "completion_notice" or receipt.get("message") != notice_message:
+                raise ValueError("delivery id already belongs to a different payload")
+            status = receipt["status"]
+            target = f"bot-chat:{profile_label}"
+            job.setdefault("_bot_chat_delivery_receipts", {})[target] = {
+                "status": status, "delivery_id": notice_key}
+            logger.info("Job '%s': Bot Chat completion notice %s receipt=%s status=%s",
+                        job_id, profile_label, notice_key, status)
+            if status == "persisted":
+                return None
+            detail = ("notification queued; durable Bot Chat record not yet committed"
+                      if status in ("queued", "claimed")
+                      else receipt.get("error") or receipt.get("reason") or "notification persistence failed")
+            return f"{target} {status} (receipt {notice_key}): {detail}"
         key = hashlib.sha256(json.dumps(
             [str(source_home), job_id, str(run_id), str(home)],
             ensure_ascii=False, separators=(",", ":"),

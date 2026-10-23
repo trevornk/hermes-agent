@@ -61,6 +61,11 @@ def _canonical_record_error(path, record, required_strings=('admission_id', 'pro
 
 def _record_shape_error(path, record):
     """Validate the known canonical, refused or legacy receipt shape for directory scans."""
+    if record.get('kind') == 'completion_notice':
+        # A no-agent cron completion notice (``deliver_completion_notice``) shares the mailbox dir;
+        # Bot Chat's TUI owner consumes it, session_bot never does (``_scan_records`` skips it).
+        from tools.bot_live_delivery import _ticket_shape_error
+        return _ticket_shape_error(path, record)
     if record.get('refused') is True and 'admission_id' not in record:
         # ``refuse_pin``: the canonical pin fields, terminal ``failed``, never admitted.
         if record.get('status') != 'failed':
@@ -100,7 +105,7 @@ def _scan_records(root, pins=None):
         if problem is not None:
             _warn_malformed(path, problem)
             continue
-        if record is not None:
+        if record is not None and record.get('kind') != 'completion_notice':
             yield path, record
 
 

@@ -148,7 +148,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
 # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
 # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
-_KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
+_KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = _BOT_COMPLETION_POLL_SECONDS = 5.0
 
 
 def _notif_release_turn(session: dict) -> None:
@@ -717,6 +717,47 @@ def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, 
     _notif_dispatch_completions(sid, session, completions, registry, deferred)
 
 
+def _poll_bot_completion_notice_once(sid: str, session: dict) -> bool:
+    """Persist and announce one cron completion without claiming an agent turn.
+
+    ``persisted`` means state.db committed a display-only Bot Chat row. It does
+    *not* claim a renderer saw a frame; a detached transport simply leaves the
+    durable row for the next reopen to hydrate.
+    """
+    from tools.bot_live_delivery import claim_pending_completion_notice, complete_completion_notice
+
+    home = _session_home(session)
+    with session["history_lock"]:
+        if session.get("_closing") or session.get("_finalized"):
+            return False
+        claimed = claim_pending_completion_notice(home, str(session.get("session_key") or ""))
+    if claimed is None:
+        return False
+
+    delivery_id = str(claimed["id"])
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=home / "state.db")
+        try:
+            db.append_completion_notice(str(session.get("session_key") or ""), str(claimed["message"]), delivery_id)
+        finally:
+            db.close()
+        complete_completion_notice(home, delivery_id, str(claimed["claim_token"]))
+    except Exception:
+        # Leave the reclaimable record non-terminal. A crash/error between its
+        # claim and state.db transaction must not make the completion disappear.
+        logger.warning("Bot completion-notice persistence failed", exc_info=True)
+        return False
+    try:
+        _emit("cron.completion", sid, {
+            "text": str(claimed["message"]),
+            "id": delivery_id,
+        })
+    except Exception:
+        logger.debug("Bot completion-notice live event failed after durable persistence", exc_info=True)
+    return True
+
+
 def _notification_poller_loop(stop_event: threading.Event, sid: str, session: dict) -> None:
     with _session_profile_runtime_scope(session):
         _notification_poller_scoped_loop(stop_event, sid, session)
@@ -740,11 +781,19 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
     emitted = session.setdefault("_notification_emitted", set())
     handle = lambda events, deferred: _notif_handle_ready(
         sid, session, events, emitted, process_registry, format_process_notification, deferred)
-    last_kanban_poll = last_loop_poll = 0.0
+    last_kanban_poll = last_loop_poll = last_bot_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         now = time.monotonic()
         # Completions whose owner process died after this one started (#97202); throttled per profile home.
         async_delegation.maybe_sweep_orphaned_completions(queue)
+        # [carried, cron_no_agent_completion_delivery] no-agent cron completion notices are
+        # display-only Bot Chat rows; the retired legacy mailbox poller is not involved.
+        if now - last_bot_poll >= _BOT_COMPLETION_POLL_SECONDS:
+            last_bot_poll = now
+            try:
+                _poll_bot_completion_notice_once(sid, session)
+            except Exception:
+                logger.warning("Bot completion-notice poll failed", exc_info=True)
         # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
         # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
         if now - last_loop_poll >= _LOOP_POLL_SECONDS:

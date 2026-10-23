@@ -493,6 +493,19 @@ event("notification.show", NotificationShowPayload, doc="Show / replace a keyed 
 event("notification.clear", NotificationClearPayload, doc="Withdraw the notice with this key.")
 
 
+class CronCompletionPayload(Payload):
+    """``tui_gateway/session_notifications.py::_poll_bot_completion_notice_once`` after the
+    state.db row committed. Best-effort live repaint only: the durable record (and Desktop's
+    next-open hydration of it) does not depend on this event being delivered or seen."""
+
+    text: str
+    id: str
+
+
+event("cron.completion", CronCompletionPayload,
+      doc="A no_agent cron job's Bot Chat completion notice was durably persisted.")
+
+
 class TipShowPayload(Payload):
     """``tools/tip_tool.py``."""
 

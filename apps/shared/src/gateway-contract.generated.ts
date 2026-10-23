@@ -5852,6 +5852,11 @@ export interface NotificationShowPayload {
 export interface NotificationClearPayload {
   key: string
 }
+/** ``tui_gateway/session_notifications.py::_poll_bot_completion_notice_once`` after the state.db row committed. Best-effort live repaint only: the durable record (and Desktop's next-open hydration of it) does not depend on this event being delivered or seen. */
+export interface CronCompletionPayload {
+  text: string
+  id: string
+}
 /** ``tools/tip_tool.py``. */
 export interface TipShowPayload {
   selector: string
@@ -7050,6 +7055,8 @@ export interface BackendGatewayEventMap {
   'connection.update': ConnectionUpdatePayload
   /** cron/jobs.json moved; refetch the cron list. */
   'cron.changed': ChangeSignalPayload
+  /** A no_agent cron job's Bot Chat completion notice was durably persisted. */
+  'cron.completion': CronCompletionPayload
   /** The install ended (0 ok, -1 cancelled, -2 no sudo: the command to run by hand was streamed). */
   'display.install.done': DisplayInstallDonePayload
   /** One line of package-manager output. */
@@ -7200,6 +7207,7 @@ export const GATEWAY_EVENT_TYPES = [
   'connection.request',
   'connection.update',
   'cron.changed',
+  'cron.completion',
   'display.install.done',
   'display.install.log',
   'display.lease',
