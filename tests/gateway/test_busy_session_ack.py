@@ -189,7 +189,7 @@ class TestBusySessionAck:
 
 
     @pytest.mark.asyncio
-    async def test_steer_mode_calls_agent_steer_no_interrupt_no_queue(self, monkeypatch):
+    async def test_steer_mode_calls_agent_steer_no_interrupt_no_queue(self, monkeypatch, caplog):
         """busy_input_mode='steer' injects via agent.steer() and skips queueing."""
         import gateway.run as _gr
 
@@ -205,9 +205,13 @@ class TestBusySessionAck:
 
         agent = MagicMock()
         agent.steer = MagicMock(return_value=True)
+        agent.get_activity_summary.return_value = {"seconds_since_activity": 7}
         runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time() - 30
 
-        with patch("gateway.platforms.base.merge_pending_message_event") as mock_merge:
+        with caplog.at_level("INFO", logger="gateway.run"), patch(
+            "gateway.platforms.base.merge_pending_message_event"
+        ) as mock_merge:
             await runner._handle_active_session_busy_message(event, sk)
 
         # VERIFY: Agent was steered, NOT interrupted
@@ -226,6 +230,48 @@ class TestBusySessionAck:
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
         assert "Steered" in content or "steer" in content.lower()
         assert "Interrupting" not in content
+
+        # VERIFY: busy-path diagnostic log fired with real agent-age/idle figures
+        assert any(
+            "Busy-path absorbed inbound message" in record.getMessage()
+            and "agent_idle=7s" in record.getMessage()
+            and "steered=True" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_busy_path_log_survives_broken_activity_summary(self, monkeypatch, caplog):
+        """A raising get_activity_summary() must degrade to idle=-1, never crash the busy path."""
+        import gateway.run as _gr
+
+        monkeypatch.delenv("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED", raising=False)
+        monkeypatch.setattr(_gr, "_load_gateway_config", dict)
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        adapter = _make_adapter()
+
+        event = _make_event(text="are you still there")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+
+        def _boom():
+            raise RuntimeError("activity summary unavailable")
+
+        agent.get_activity_summary = _boom
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time() - 5
+
+        with caplog.at_level("INFO", logger="gateway.run"):
+            result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        assert any(
+            "Busy-path absorbed inbound message" in record.getMessage()
+            and "agent_idle=-1s" in record.getMessage()
+            for record in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_steer_mode_transcribes_voice_before_injection(self, monkeypatch):
