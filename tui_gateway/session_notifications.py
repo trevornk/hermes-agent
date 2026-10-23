@@ -5,6 +5,7 @@ desktop UI wiring, HUD surface note. Bodies are rebound onto server.py's globals
 from __future__ import annotations
 
 import contextlib
+import re
 
 from .method_ctx import bind_module
 
@@ -389,10 +390,29 @@ def _kb_completed(task, payload: dict, title: str) -> str:
     return f" done — {title}{handoff}"
 
 
-def _kb_timed_out(task, payload: dict, title: str) -> str:
+_KB_BUDGET_ERROR_RE = re.compile(r"^Iteration budget exhausted \((\d+)/(\d+)\)")
+
+
+def _kb_budget(payload: dict) -> Optional[tuple[int, int]]:
+    """(used, max) when a timed_out event is iteration-budget exhaustion, else None. Older
+    events carry only the error text, so fall back to parsing it."""
     with contextlib.suppress(TypeError, ValueError):
-        return f" timed out (max_runtime={int(payload.get('limit_seconds') or 0)}s); will retry"
-    return " timed out (max_runtime=0s); will retry"
+        if payload.get("budget_max") is not None:
+            return int(payload.get("budget_used") or 0), int(payload["budget_max"])
+    if m := _KB_BUDGET_ERROR_RE.match(str(payload.get("error") or "")):
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _kb_timed_out(task, payload: dict, title: str) -> str:
+    # Only promise a retry when the card was actually put back in a claimable lane.
+    retry = "" if payload.get("retry_status") == "blocked" else "; will retry"
+    if (budget := _kb_budget(payload)) is not None:
+        return f" hit its iteration budget ({budget[0]}/{budget[1]}){retry}"
+    limit = 0
+    with contextlib.suppress(TypeError, ValueError):
+        limit = int(payload.get("limit_seconds") or getattr(task, "max_runtime_seconds", None) or 0)
+    return f" timed out (max_runtime={limit}s){retry}" if limit > 0 else f" timed out{retry}"
 
 
 # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.

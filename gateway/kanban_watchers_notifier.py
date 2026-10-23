@@ -459,10 +459,29 @@ def _fmt_gave_up(ev, n) -> tuple:
     return t("gateway.kanban.ping.gave_up", head=n.head, count=count, last=last, task_id=n.task_id), None, None
 
 
+_BUDGET_ERROR_RE = re.compile(r"^Iteration budget exhausted \((\d+)/(\d+)\)")
+
+
+def _timed_out_budget(ev) -> Optional[tuple[int, int]]:
+    """(used, max) when a timed_out event is iteration-budget exhaustion, else None. Older
+    events carry only the error text, so fall back to parsing it."""
+    with contextlib.suppress(TypeError, ValueError):
+        if _payload(ev, "budget_max") is not None:
+            return int(_payload(ev, "budget_used") or 0), int(_payload(ev, "budget_max"))
+    if m := _BUDGET_ERROR_RE.match(str(_payload(ev, "error") or "")):
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
 def _fmt_timed_out(ev, n) -> tuple:
-    limit = int(_payload(ev, "limit_seconds") or 0)
-    minutes = max(1, round(limit / 60)) if limit else 0
-    span = t("gateway.kanban.ping.limit_minutes", minutes=minutes) if minutes else t("gateway.kanban.ping.limit_generic")
+    if (budget := _timed_out_budget(ev)) is not None:
+        span = t("gateway.kanban.ping.limit_iterations", used=budget[0], max=budget[1])
+    else:
+        limit = 0
+        with contextlib.suppress(TypeError, ValueError):
+            limit = int(_payload(ev, "limit_seconds") or 0)
+        minutes = max(1, round(limit / 60)) if limit else 0
+        span = t("gateway.kanban.ping.limit_minutes", minutes=minutes) if minutes else t("gateway.kanban.ping.limit_generic")
     return t("gateway.kanban.ping.timed_out", head=n.head, span=span), None, None
 
 

@@ -254,6 +254,7 @@ gateway:
       gave_up: "⛔ {head} محظورة الآن: {count}{last}. أصلح السبب، ثم شغّل `hermes kanban unblock {task_id}` (أو `hermes kanban reassign {task_id}`). السجلات: `hermes kanban log {task_id}`."
       limit_minutes: "حدّها البالغ {minutes} دقيقة"
       limit_generic: "حدّها الزمني"
+      limit_iterations: "ميزانية التكرارات الخاصة بها ({used}/{max})"
       timed_out: "⏱ {head} تجاوزت {span} فأُوقفت؛ ستُعاد المحاولة تلقائيًا."
       blocked: "⏸ {head} محظورة{reason}"
       crashed: "✖ {head} — توقّف عاملها بشكل غير متوقّع؛ ستُعاد المحاولة تلقائيًا."

@@ -254,6 +254,7 @@ gateway:
       gave_up: "⛔ {head} 現已被阻擋：{count}{last}。修正原因後執行 `hermes kanban unblock {task_id}`（或 `hermes kanban reassign {task_id}`）。日誌：`hermes kanban log {task_id}`。"
       limit_minutes: "{minutes} 分鐘的限制"
       limit_generic: "時間限制"
+      limit_iterations: "迭代次數上限 ({used}/{max})"
       timed_out: "⏱ {head} 超過{span}而被停止；將自動重試。"
       blocked: "⏸ {head} 已被阻擋{reason}"
       crashed: "✖ {head} — 其工作者意外停止；將自動重試。"

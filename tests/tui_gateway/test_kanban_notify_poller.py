@@ -248,6 +248,36 @@ class TestFormatKanbanEventText:
         ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": "not-a-number"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "timed out" in text
+        assert "max_runtime=0s" not in text
+
+    def test_timed_out_iteration_budget_names_the_budget(self):
+        ev = SimpleNamespace(kind="timed_out", payload={
+            "error": "Iteration budget exhausted (60/60) — task could not complete within the allowed iterations",
+            "budget_used": 60, "budget_max": 60, "failures": 1, "retry_status": "ready"})
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert "iteration budget (60/60); will retry" in text
+        assert "max_runtime" not in text
+
+    def test_timed_out_legacy_budget_event_parsed_from_error(self):
+        ev = SimpleNamespace(kind="timed_out", payload={
+            "error": "Iteration budget exhausted (20/20) — task could not complete within the allowed iterations",
+            "failures": 1, "retry_status": "ready"})
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert "iteration budget (20/20)" in text
+
+    def test_timed_out_wall_clock_falls_back_to_task_cap_never_zero(self):
+        task = SimpleNamespace(title="t", assignee="worker", result=None, max_runtime_seconds=1800)
+        ev = SimpleNamespace(kind="timed_out", payload={"elapsed_seconds": 1900})
+        assert "max_runtime=1800s" in _format_kanban_event_text(self.SUB, task, ev, "")
+        ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": 600})
+        assert "max_runtime=600s" in _format_kanban_event_text(self.SUB, task, ev, "")
+        no_cap = SimpleNamespace(kind="timed_out", payload={})
+        text = _format_kanban_event_text(self.SUB, self.TASK, no_cap, "")
+        assert "timed out; will retry" in text and "max_runtime" not in text
+
+    def test_timed_out_blocked_retry_status_does_not_promise_retry(self):
+        ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": 60, "retry_status": "blocked"})
+        assert "will retry" not in _format_kanban_event_text(self.SUB, self.TASK, ev, "")
 
 
 class TestNotificationPollerLoopKanbanWiring:

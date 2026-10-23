@@ -138,3 +138,18 @@ def test_status_clause_fences_even_when_run_id_still_matches(board):
     _as_worker(mp, tid, run_id)
 
     assert _snapshot(conn, tid) == before
+
+
+def test_below_breaker_timed_out_event_keeps_budget_fields(board):
+    """Notifiers name iteration exhaustion from budget_used/budget_max; the below-breaker
+    branch used to drop them, so the ping guessed a wall-clock limit (max_runtime=0s)."""
+    conn, mp = board
+    tid = kb.create_task(conn, title="live", assignee="default")
+    run_id = kb.claim_task(conn, tid).current_run_id
+
+    _as_worker(mp, tid, run_id)
+
+    ev = [e for e in kb.list_events(conn, tid) if e.kind == "timed_out"][-1]
+    assert ev.run_id == run_id
+    assert (ev.payload["budget_used"], ev.payload["budget_max"]) == (90, 90)
+    assert ev.payload["retry_status"] == "ready"

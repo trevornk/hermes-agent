@@ -796,3 +796,27 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def _fmt_timed_out(payload):
+    from gateway.kanban_watchers_notifier import _EVENT_FORMATTERS
+
+    msg, _, _ = _EVENT_FORMATTERS["timed_out"](_StubEvent(payload), _StubNotif())
+    return msg
+
+
+def test_timed_out_iteration_budget_names_the_budget_not_a_time_limit():
+    msg = _fmt_timed_out({"budget_used": 60, "budget_max": 60, "retry_status": "ready",
+                          "error": "Iteration budget exhausted (60/60) — task could not complete"})
+    assert "iteration budget (60/60)" in msg
+    assert "time limit" not in msg
+
+
+def test_timed_out_legacy_budget_event_is_parsed_from_error_text():
+    msg = _fmt_timed_out({"error": "Iteration budget exhausted (20/20) — task could not complete"})
+    assert "iteration budget (20/20)" in msg
+
+
+def test_timed_out_wall_clock_keeps_minutes_and_tolerates_bad_payload():
+    assert "30-minute limit" in _fmt_timed_out({"limit_seconds": 1800})
+    assert "time limit" in _fmt_timed_out({"limit_seconds": "not-a-number"})

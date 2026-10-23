@@ -254,6 +254,7 @@ gateway:
       gave_up: "⛔ {head} ist jetzt blockiert: {count}{last}. Beheben Sie die Ursache, dann `hermes kanban unblock {task_id}` (oder `hermes kanban reassign {task_id}`). Logs: `hermes kanban log {task_id}`."
       limit_minutes: "das Limit von {minutes} Minuten"
       limit_generic: "das Zeitlimit"
+      limit_iterations: "das Iterationsbudget ({used}/{max})"
       timed_out: "⏱ {head} hat {span} überschritten und wurde gestoppt; es wird automatisch erneut versucht."
       blocked: "⏸ {head} blockiert{reason}"
       crashed: "✖ {head} — der Worker wurde unerwartet beendet; es wird automatisch erneut versucht."

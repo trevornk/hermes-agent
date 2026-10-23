@@ -254,6 +254,7 @@ gateway:
       gave_up: "⛔ {head} тепер заблоковано: {count}{last}. Усуньте причину, потім `hermes kanban unblock {task_id}` (або `hermes kanban reassign {task_id}`). Журнали: `hermes kanban log {task_id}`."
       limit_minutes: "ліміт у {minutes} хвилин"
       limit_generic: "ліміт часу"
+      limit_iterations: "ліміт ітерацій ({used}/{max})"
       timed_out: "⏱ {head}: перевищено {span}, роботу зупинено; спробу буде повторено автоматично."
       blocked: "⏸ {head} заблоковано{reason}"
       crashed: "✖ {head} — воркер несподівано зупинився; спробу буде повторено автоматично."
