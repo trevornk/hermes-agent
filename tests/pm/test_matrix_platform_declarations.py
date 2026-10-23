@@ -25,5 +25,5 @@ def test_matrix_platform_declarations(platform: str) -> None:
     assert set(selected) == {'mautrix', 'aiosqlite', 'asyncpg', 'aiohttp-socks', 'aiohttp'}
     assert selected['mautrix'].extras == ({'encryption'} if platform == 'linux' else set())
     for name, version in {'mautrix': '0.21.1', 'aiosqlite': '0.22.1', 'asyncpg': '0.31.0',
-                          'aiohttp-socks': '0.11.0', 'aiohttp': '3.14.3'}.items():
+                          'aiohttp-socks': '0.11.0', 'aiohttp': '3.14.5'}.items():
         assert str(selected[name].specifier) == f'=={version}'
