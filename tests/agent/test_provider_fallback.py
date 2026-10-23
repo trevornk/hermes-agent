@@ -12,7 +12,7 @@ from agent.error_classifier import FailoverReason
 from run_agent import AIAgent
 
 
-def _make_agent(fallback_model=None):
+def _make_agent(fallback_model=None, service_tier=None, request_overrides=None):
     """Create a minimal AIAgent with optional fallback config."""
     with (
         patch("model_tools.get_tool_definitions", return_value=[]),
@@ -26,6 +26,8 @@ def _make_agent(fallback_model=None):
             skip_context_files=True,
             skip_memory=True,
             fallback_model=fallback_model,
+            service_tier=service_tier,
+            request_overrides=request_overrides,
         )
         agent.client = MagicMock()
         return agent
@@ -545,3 +547,131 @@ class TestMoaPresetFallback:
                             fallback_model={"provider": "moa", "model": "default"})
         _assert_bound_to_moa_preset(agent)
         assert agent._fallback_activated is True
+
+
+# ── Static fast-mode params must not leak across a provider fallback ───────
+#
+# Incident: agent.service_tier="priority" pins {"speed": "fast"} into
+# agent.request_overrides at build time (static /fast on Anthropic). A 429
+# on Anthropic activates the openai-codex fallback; try_activate_fallback()
+# swaps model/provider/client but request_overrides travels over UNCHANGED
+# (_rescope_fallback_extra_body only key-scopes ``extra_body``, never the
+# top-level ``speed``/``service_tier`` fast-mode keys). The Codex Responses
+# transport then raises "unsupported field(s): speed" — a self-inflicted
+# hard failure on every fallback turn while static fast mode is on, for
+# ANY route the new provider doesn't support (Anthropic->Codex/xAI/OpenRouter/
+# custom). See agent/codex_responses_adapter.py::_preflight_codex_api_kwargs.
+
+
+class TestFastModeParamsDoNotLeakAcrossFallback:
+    def test_anthropic_speed_override_dropped_on_codex_fallback(self):
+        """Static /fast (Anthropic speed=fast) must not survive a fallback to
+        openai-codex — Codex's Responses API 400s on an unknown ``speed`` field."""
+        agent = _make_agent(
+            fallback_model=[{"provider": "openai-codex", "model": "gpt-6-astra"}],
+            service_tier="priority",
+            request_overrides={"speed": "fast"},
+        )
+        agent.provider = "anthropic"
+        agent.model = "claude-opus-5"
+        agent.base_url = "https://api.anthropic.com"
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(base_url="https://chatgpt.com/backend-api/codex"), "gpt-6-astra"),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.provider == "openai-codex"
+        assert "speed" not in agent.request_overrides, (
+            "Anthropic-only 'speed' override leaked into request_overrides after "
+            f"falling back to a Codex provider: {agent.request_overrides!r}"
+        )
+
+    def test_openai_service_tier_dropped_on_route_that_rejects_it(self):
+        """Static /fast (OpenAI service_tier=priority) must not survive a
+        fallback to a route that doesn't support Priority Processing
+        (openrouter never receives service_tier/speed — see
+        hermes_cli.models._fast_mode_route_supported)."""
+        agent = _make_agent(
+            fallback_model=[{"provider": "openrouter", "model": "z-ai/glm-4.7"}],
+            service_tier="priority",
+            request_overrides={"service_tier": "priority"},
+        )
+        agent.provider = "openai"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://api.openai.com/v1"
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(base_url="https://openrouter.ai/api/v1"), "z-ai/glm-4.7"),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.provider == "openrouter"
+        assert "service_tier" not in agent.request_overrides, (
+            "OpenAI-only 'service_tier' override leaked into request_overrides after "
+            f"falling back to a route that doesn't support it: {agent.request_overrides!r}"
+        )
+
+    def test_fast_param_reapplied_when_fallback_route_supports_it(self):
+        """The route-aware fix must not just blanket-strip fast params — a
+        fallback route that DOES support the SAME provider family's fast
+        param should still get it (openai -> openai-codex keeps
+        service_tier=priority; native Codex accepts Priority Processing)."""
+        agent = _make_agent(
+            fallback_model=[{"provider": "openai-codex", "model": "gpt-6-astra"}],
+            service_tier="priority",
+            request_overrides={"service_tier": "priority"},
+        )
+        agent.provider = "openai"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://api.openai.com/v1"
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(base_url="https://chatgpt.com/backend-api/codex"), "gpt-6-astra"),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.provider == "openai-codex"
+        assert agent.request_overrides.get("service_tier") == "priority", (
+            "service_tier=priority should be re-derived (not merely preserved) for "
+            "a fallback route that legitimately supports OpenAI Priority Processing"
+        )
+
+    def test_stale_speed_stripped_even_when_resolver_raises_during_fallback(self):
+        """Resolver failures: try_activate_fallback()'s outer try/except
+        treats a raise from rescope_route_fast_override() the same as any
+        other mid-activation failure (candidate abandoned, chain advances) —
+        that broad-except-and-continue behavior is pre-existing and out of
+        scope here. What must hold regardless: the stale Anthropic-only
+        'speed' key is gone, because rescope_route_fast_override() commits
+        the strip to agent.request_overrides BEFORE calling the resolver, so
+        the mutation already landed on the live agent before the exception
+        was raised and caught — a resolver failure can only cost the fresh
+        re-derivation, never leave an outbound-rejected stale param."""
+        agent = _make_agent(
+            fallback_model=[{"provider": "openai-codex", "model": "gpt-6-astra"}],
+            service_tier="priority",
+            request_overrides={"speed": "fast"},
+        )
+        agent.provider = "anthropic"
+        agent.model = "claude-opus-5"
+        agent.base_url = "https://api.anthropic.com"
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(base_url="https://chatgpt.com/backend-api/codex"), "gpt-6-astra"),
+            ),
+            patch(
+                "hermes_cli.models.resolve_fast_mode_overrides",
+                side_effect=RuntimeError("resolver boom"),
+            ),
+        ):
+            # Single fallback candidate; the resolver blow-up aborts that
+            # candidate's activation via the existing broad except, so the
+            # chain is exhausted and this call reports failure.
+            assert agent._try_activate_fallback() is False
+
+        assert "speed" not in agent.request_overrides, (
+            "stale Anthropic-only 'speed' must be stripped even when the "
+            f"fast-mode resolver raises during fallback: {agent.request_overrides!r}"
+        )

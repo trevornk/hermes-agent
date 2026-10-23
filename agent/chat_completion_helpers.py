@@ -2082,6 +2082,8 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
+            from agent.fast_mode import rescope_route_fast_override
+            rescope_route_fast_override(agent)
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
             notice = (

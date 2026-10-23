@@ -2478,6 +2478,26 @@ def switch_model(
     # short-circuiting the freshly selected healthy provider.
     from agent.chat_completion_helpers import _reset_stale_streak
     _reset_stale_streak(agent)
+    # Re-derive the static fast-mode param (speed/service_tier) for the destination route
+    # BEFORE the _primary_runtime snapshot is built: agent.model/provider/base_url already
+    # hold the new route (set by _swap_switch_runtime above), so this fixes the live value in
+    # time for the snapshot to capture it too — otherwise a later fallback+restore_primary_runtime()
+    # would resurrect the pre-switch route's stale speed/service_tier via the frozen snapshot.
+    # (_finish_switch below, which runs AFTER the snapshot by design so a caller-supplied
+    # extra_body override survives a non-matching custom-provider switch, does not touch
+    # speed/service_tier — no ordering conflict with that snapshot-freeze contract.)
+    try:
+        from agent.fast_mode import rescope_route_fast_override
+        rescope_route_fast_override(agent)
+    except Exception:
+        # rescope_route_fast_override() commits the stale-marker strip to
+        # agent.request_overrides BEFORE calling the resolver, so a resolver
+        # exception here can never leave a route-incompatible speed/service_tier
+        # key behind — only the RE-DERIVATION of a fresh marker for the new
+        # route can be lost, which debug-logging and continuing is safe to do
+        # (worst case: /fast silently doesn't apply on this route until the
+        # next rescope call, never an outbound-rejected stale param).
+        logger.debug("switch_model: fast-mode override re-derivation failed", exc_info=True)
     agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
     _finish_switch(agent, new_provider, old_norm, new_norm)
     logger.info(

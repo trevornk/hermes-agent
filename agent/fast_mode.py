@@ -117,3 +117,76 @@ def mark_fast_mode_unavailable(agent: Any) -> bool:
         return False
     unavailable.add(model)
     return True
+
+
+#: The exact synthetic values ``resolve_fast_mode_overrides`` produces for the
+#: static ``/fast`` toggle. A key present with a DIFFERENT value (e.g. an
+#: explicit ``service_tier: "flex"``) is a genuine user setting, not the /fast
+#: marker, and must never be treated as stale or clobbered by re-derivation.
+_FAST_MODE_SENTINELS: dict[str, Any] = {"speed": "fast", "service_tier": "priority"}
+
+
+def rescope_route_fast_override(agent: Any) -> None:
+    """Re-derive the STATIC fast-mode override baked into ``agent.request_overrides``
+    (``agent.service_tier == "priority"``: Anthropic Fast Mode's ``speed`` or
+    OpenAI/xAI Priority Processing's ``service_tier``) for the route ``agent`` now
+    points at.
+
+    A static override is pinned into ``request_overrides`` ONCE, at agent-init /
+    turn-route-resolution time, for the route active THEN. A subsequent provider
+    fallback or in-place ``/model`` switch changes ``agent.model``/``provider``/
+    ``base_url`` but never touches this pinned value — so a provider-specific
+    param (Anthropic-only ``speed``, OpenAI/xAI-only ``service_tier``) rides
+    along onto a route that never asked for it and, worse, may hard-reject the
+    unknown field (the Codex Responses transport 400s on any key outside its
+    allow-list — see ``agent.codex_responses_adapter._preflight_codex_api_kwargs``).
+    Bounded ``auto``/``cold`` windows are unaffected: ``effective_request_overrides()``
+    re-derives them from the CURRENT route on every request already.
+
+    Call this once a swap/switch has finished mutating ``agent.model``/
+    ``provider``/``base_url``/``api_mode``. Only a key whose CURRENT value equals
+    the synthetic /fast marker (see ``_FAST_MODE_SENTINELS``) is ever touched — an
+    explicit, unrelated value under the same key (e.g. a genuine
+    ``service_tier: "flex"``) is left alone in both directions: never dropped as
+    "stale" and never overwritten by a freshly re-derived synthetic value. The
+    strip is committed to ``agent.request_overrides`` BEFORE the resolver runs, so
+    a resolver exception can never leave a stale, route-incompatible marker key on
+    the agent even if the caller only logs and swallows it. A fresh marker is
+    re-derived whenever the static toggle is on, independent of whether a stale
+    marker was present — a route that legitimately supports fast mode gets it
+    re-enabled even after an intermediate unsupported hop already cleared it.
+    """
+    # Value equality with a sentinel is NOT provenance: an explicit caller-set
+    # request_overrides["service_tier"] == "priority" happens to collide with the
+    # synthetic /fast marker's value. Only the static preference OWNER
+    # (agent.service_tier == "priority") may strip/re-derive these keys; when the
+    # static toggle is off, an explicit override under the same key is a genuine
+    # user setting and must be left untouched in both directions.
+    if getattr(agent, "service_tier", None) != "priority":
+        return
+
+    overrides = dict(getattr(agent, "request_overrides", None) or {})
+    for key, sentinel in _FAST_MODE_SENTINELS.items():
+        if overrides.get(key) == sentinel:
+            overrides.pop(key)
+    # Commit the strip now — before any resolver call that may raise — so a
+    # stale, route-incompatible marker can never survive an exception below.
+    agent.request_overrides = overrides
+
+    from hermes_cli.models import resolve_fast_mode_overrides
+    base_url = getattr(agent, "base_url", None)
+    if getattr(agent, "api_mode", None) == "anthropic_messages":
+        base_url = getattr(agent, "_anthropic_base_url", None) or base_url
+    fresh = resolve_fast_mode_overrides(
+        getattr(agent, "model", None), provider=getattr(agent, "provider", None), base_url=base_url,
+    ) or {}
+    if not fresh:
+        return
+    changed = False
+    for key, value in fresh.items():
+        if key in overrides:
+            continue  # explicit non-marker value present (markers already stripped above) — don't clobber
+        overrides[key] = value
+        changed = True
+    if changed:
+        agent.request_overrides = overrides
