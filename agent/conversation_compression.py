@@ -129,8 +129,14 @@ COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE = (
 # un-swallowed in tests/gateway/test_telegram_noise_filter.py::VISIBLE_COMPRESSION_MESSAGES.
 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE = (
     "⚠ Context is over the compression threshold (~{tokens:,} tokens >= {threshold:,}) "
-    "but compression is currently blocked ({reason}). The model may stop responding. Run /new to start a fresh "
-    "session or /compress to retry immediately."
+    "but automatic compression is currently blocked ({reason}). This is not the model context limit; "
+    "you can continue, run /compress to retry now, or /new to start fresh."
+)
+
+CONTEXT_OVERFLOW_HARD_RISK_WARNING_TEMPLATE = (
+    "⚠ Context is at or beyond the model context limit (~{tokens:,} tokens >= {context_length:,}). "
+    "Automatic compression is currently blocked ({reason}); the next request may fail. "
+    "Run /compress to retry now or /new to start fresh."
 )
 
 # Formatted from the same constants the emission sites use, so noise-filter tests exercise the ACTUAL wording.

@@ -21,11 +21,40 @@ from agent.conversation_compression import (
 )
 from agent.turn_context import _review_fork_first_request_pending
 from agent.turn_context_compaction import (
-    _apply_grown_window, _blocked_compress_reason, _clear_overflow_warn, _refund_api_call,
+    _apply_grown_window, _blocked_compress_reason,
+    _recover_overflow_warn_if_measured_below_threshold, _refund_api_call,
     _reanchor, _reset_retry_state_after_compaction,
 )
 
 logger = logging.getLogger("agent.conversation_loop")
+
+
+def _request_pressure_compaction_eligible(
+    compressor: Any,
+    messages: Any,
+    request_pressure_tokens: int,
+    *,
+    provider_overflow_preflight: bool = False,
+) -> bool:
+    """Use an engine's message-aware request-pressure policy when supplied.
+
+    Provider-proven overflow is never deferrable: recovery must compact even
+    when an optional engine policy sees no ordinary maintenance work. Context
+    engines predating the optional hook retain the historical token-only
+    behavior. This is deliberately separate from the sub-threshold
+    ``should_compress_preflight`` maintenance hook: the pre-API gate must not
+    force an engine to ingest or mutate state merely to answer eligibility.
+    """
+    if provider_overflow_preflight:
+        return True
+    hook = getattr(compressor, "should_compress_request_pressure", None)
+    if callable(hook):
+        verdict = hook(messages, request_pressure_tokens)
+        # Type pin: MagicMock compressor doubles auto-create a hook that returns a
+        # truthy Mock; only a real bool verdict may supersede the token-only gate.
+        if isinstance(verdict, bool):
+            return verdict
+    return bool(compressor.should_compress(request_pressure_tokens))
 
 
 @dataclass
@@ -98,8 +127,15 @@ def run_preflight_compression(
         and not _review_fork_first_request_pending(agent)
         and (not v._preflight_compression_blocked or provider_overflow_preflight)
         and (not defer_preflight(request_pressure_tokens) or provider_overflow_preflight)
-        and not _compression_cooldown
-        and compressor.should_compress(request_pressure_tokens)
+        # Provider-proven overflow gets ONE real attempt per pass while the summary-failure
+        # cooldown stays armed (bypass_cooldown below); ordinary pressure waits it out.
+        and (not _compression_cooldown or provider_overflow_preflight)
+        and _request_pressure_compaction_eligible(
+            compressor,
+            v.messages,
+            request_pressure_tokens,
+            provider_overflow_preflight=provider_overflow_preflight,
+        )
     ):
         # Managed local runtime: grow the context window before compressing (last
         # resort). Only for a llamacpp provider at the supervised base_url.
@@ -113,9 +149,6 @@ def run_preflight_compression(
         if moa_prepared_request is not None:
             v.pending_moa_prepared_request = moa_prepared_request
         v.compression_attempts += 1
-        # Compression is running: reset the blocked-overflow warning dedup so a
-        # later blocked turn warns again.
-        _clear_overflow_warn(agent)
         _threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
         _context_length = int(getattr(compressor, "context_length", 0) or 0)
         logger.info(
@@ -147,6 +180,7 @@ def run_preflight_compression(
         v.messages, v.active_system_prompt = agent._compress_context(
             v.messages, system_message, approx_tokens=request_pressure_tokens,
             task_id=effective_task_id, trigger="pre_api",
+            **({"bypass_cooldown": True} if provider_overflow_preflight else {}),
         )
         if context_compression_timed_out(agent):
             # Progress-aware timeout: never reached the provider — refund the
@@ -218,6 +252,13 @@ def run_preflight_compression(
             if callable(_warn_fn):
                 _warn_fn(request_pressure_tokens, _ctx_len)
 
+    elif agent.compression_enabled:
+        # Sub-threshold and unblocked: recovery only on a provider-anchored figure.
+        _recover_overflow_warn_if_measured_below_threshold(
+            agent, compressor, request_pressure_tokens,
+            measured=bool(getattr(agent, "_request_pressure_anchored", False)),
+        )
+
     if provider_overflow_preflight:
         # Any other gate blocking the forced preflight (e.g. uncompressible one-
         # message request) must fail closed: the request is proven not to fit.
@@ -280,6 +321,8 @@ def compress_after_tool_results(
     from agent.usage_anchor import anchored_context_tokens
 
     _anchored = anchored_context_tokens(messages, getattr(agent, "_usage_anchor", None))
+    # Recovery evidence: only the two provider-reported figures below are measurements.
+    _measured = True
     if _anchored is not None:
         _real_tokens = _anchored
     elif _compressor.last_prompt_tokens > 0:
@@ -288,7 +331,9 @@ def compress_after_tool_results(
         _real_tokens = _compressor.last_prompt_tokens
     elif _compressor.last_prompt_tokens == -1:
         _real_tokens = 0
+        _measured = False
     else:
+        _measured = False
         _real_tokens = _midturn_request_pressure_tokens(
             agent, messages, active_system_prompt or "",
             estimate_request_tokens_rough(messages, tools=agent.tools or None),
@@ -302,12 +347,9 @@ def compress_after_tool_results(
         and not bool(
             getattr(_compressor, "awaiting_real_usage_after_compression", False)
         )
-        and _compressor.should_compress(_real_tokens)
+        and _request_pressure_compaction_eligible(_compressor, messages, _real_tokens)
     ):
         compression_attempts += 1
-        # Compression is running: reset blocked-overflow warning dedup so a
-        # future blocked turn can warn again.
-        _clear_overflow_warn(agent)
         agent._safe_print("  ⟳ compacting context…")
         _post_tool_input = messages
         # Pass overhead-aware _real_tokens, not last_prompt_tokens (0 in the
@@ -393,4 +435,8 @@ def compress_after_tool_results(
                 # read_file bodies survive only as one-line markers, so the repeat-read dedup must
                 # stop answering "unchanged" for them or the reload the marker asks for is refused.
                 _reset_read_dedup_caches(effective_task_id, session_id=agent.session_id or "")
+    if agent.compression_enabled:
+        _recover_overflow_warn_if_measured_below_threshold(
+            agent, _compressor, _real_tokens, measured=_measured
+        )
     return _verdict(False)

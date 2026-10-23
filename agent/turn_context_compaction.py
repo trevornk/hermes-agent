@@ -40,19 +40,34 @@ class CompactionOutcome:
 # ── Helpers shared by every compression-attempt site ──
 
 
-def _clear_overflow_warn(agent: Any) -> None:
-    """Re-arm the context-overflow warning dedup (test doubles may lack the method)."""
-    # Compression is actually running (block cleared / was never blocked) — reset the blocked-overflow
-    # warning dedup so a future blocked-over-threshold turn can warn again. Mirrors the turn-context
-    # preflight reset (silent-overflow fix #62625). getattr guard: test doubles built via object.__new__
-    # lack the method (gateway test-double pitfall) — treat absence as no-op.
-    # Compression is actually running (block cleared / was never blocked) — reset the blocked-overflow
-    # warning dedup so a future blocked-over-threshold turn can warn again (silent-overflow fix #62625).
-    # getattr guard: test doubles built via object.__new__ lack the method (gateway test-double pitfall) —
-    # treat absence as no-op.
+def _clear_overflow_warn(agent: Any, *, recovered: bool = False) -> None:
+    """Re-arm the warning only when an observed request is back in a safe state."""
     _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
     if callable(_clear_warn):
-        _clear_warn()
+        _clear_warn(recovered=recovered)
+
+
+def _recover_overflow_warn_if_measured_below_threshold(
+    agent: Any, compressor: Any, tokens: Any, *, measured: bool,
+) -> None:
+    """End a blocked-warning episode only on recovery evidence: a MEASURED figure
+    strictly below the threshold. ``measured`` is true for a provider-anchored figure
+    (real ``prompt_tokens`` covering the transcript plus the appended delta) or the
+    re-measure after a committed compaction pass. Rough estimates, the ``0``
+    no-usage fallback and the ``-1`` post-compaction sentinel never recover."""
+    if not measured or isinstance(tokens, bool) or not isinstance(tokens, int) or tokens <= 0:
+        return
+    if tokens < int(getattr(compressor, "threshold_tokens", 0) or 0):
+        _clear_overflow_warn(agent, recovered=True)
+
+
+def _request_pressure_compaction_eligible(
+    compressor: Any, messages: List[Dict[str, Any]], prompt_tokens: int,
+) -> bool:
+    """Late-bind the shared policy without creating a module import cycle."""
+    from agent.turn_preflight import _request_pressure_compaction_eligible as _eligible
+
+    return _eligible(compressor, messages, prompt_tokens)
 
 
 def _reset_retry_state_after_compaction(agent: Any) -> None:
@@ -308,7 +323,11 @@ def _preflight_compression(
             getattr(agent, "codex_app_server_auto_compaction", "native"),
         )
     else:
-        _should_compress_now = _compressor.should_compress(_preflight_tokens)
+        # Ordinary request-pressure compression must let message-aware engines
+        # decline a protected-tail-only no-op.
+        _should_compress_now = _request_pressure_compaction_eligible(
+            _compressor, out.messages, _preflight_tokens
+        )
         if not _should_compress_now:
             _compress_block_reason = _blocked_compress_reason(_compressor, _preflight_tokens)
     if _should_compress_now:
@@ -322,7 +341,9 @@ def _preflight_compression(
             _grown = None
         if _grown:
             _apply_grown_window(agent, _compressor, _grown)
-            _should_compress_now = _compressor.should_compress(_preflight_tokens)
+            _should_compress_now = _request_pressure_compaction_eligible(
+                _compressor, out.messages, _preflight_tokens
+            )
     if _should_compress_now:
         _run_preflight_passes(
             agent, out, _compressor, _preflight_tokens, system_message, effective_task_id
@@ -334,8 +355,12 @@ def _preflight_compression(
             _compress_block_reason, _preflight_tokens, _compressor.threshold_tokens
         )
     else:
-        # Sub-threshold and unblocked — re-arm the overflow warning.
-        _clear_overflow_warn(agent)
+        # Only a measured sub-threshold request ends the warning episode. A
+        # deferred/native skip may be above threshold without a blocker reason.
+        _recover_overflow_warn_if_measured_below_threshold(
+            agent, _compressor, _preflight_tokens,
+            measured=bool(getattr(agent, "_request_pressure_anchored", False)),
+        )
         # Engine maintenance only when NO skip-branch fired: cooldown, deferred
         # estimate, or codex-native route keep the engine hook unconsulted.
         if not (_compression_cooldown or _preflight_deferred or _codex_native_auto):
@@ -358,9 +383,6 @@ def _run_preflight_passes(
     from agent import turn_context as _tc
 
     out.compressed = True
-    # Compression is actually running — reset the dedup so a future blocked turn can
-    # warn again.
-    _clear_overflow_warn(agent)
     logger.info(
         "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
         f"{_preflight_tokens:,}", f"{_compressor.threshold_tokens:,}", agent.model,
@@ -417,7 +439,13 @@ def _run_preflight_passes(
             agent, out.messages, out.conversation_history
         )
         _reset_retry_state_after_compaction(agent)
-        if not _compressor.should_compress(_preflight_tokens):
+        # A committed pass re-measured below threshold is verified recovery.
+        _recover_overflow_warn_if_measured_below_threshold(
+            agent, _compressor, _preflight_tokens, measured=True
+        )
+        if not _request_pressure_compaction_eligible(
+            _compressor, out.messages, _preflight_tokens
+        ):
             break
         if not _tc._compression_warrants_another_preflight_pass(
             _orig_tokens, _preflight_tokens, _compressor.threshold_tokens
@@ -500,7 +528,7 @@ def _rearm_uncompressed_overflow_warn(
             break
     # Cheap gate: raw text under ~1/4 of the window (4 chars/token) cannot be over it.
     if _raw_chars <= _ctx_len:
-        _clear_overflow_warn(agent)
+        _clear_overflow_warn(agent, recovered=True)
         return
     # Re-arm with the same route-aware (checkpoint-pruned wire) figure the warn site
     # measures, else a compacted session never clears the dedup and genuine overflow
@@ -509,4 +537,4 @@ def _rearm_uncompressed_overflow_warn(
         agent, messages, active_system_prompt or ""
     )
     if _uncompressed_tokens <= _ctx_len:
-        _clear_overflow_warn(agent)
+        _clear_overflow_warn(agent, recovered=True)
