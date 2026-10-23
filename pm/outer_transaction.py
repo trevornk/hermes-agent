@@ -20,7 +20,8 @@ def active() -> bool:
 
 
 @contextmanager
-def publication(target: Path, staged: Path | None) -> Iterator[None]:
+def publication(target: Path, staged: Path | None, *, replace_symlink: bool = False) -> Iterator[None]:
+    """Set replace_symlink only for directory-entry replacement, never a write-through."""
     snapshot = os.environ.get("HERMES_UPDATE_SNAPSHOT")
     if not snapshot:
         yield
@@ -41,8 +42,9 @@ def publication(target: Path, staged: Path | None) -> Iterator[None]:
         raise RuntimeError("outer publication helper is unavailable")
     producer = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(producer)
+    options = {"replace_symlink": True} if replace_symlink else {}
     with producer.producer_publication(destination, repo_root(), dependency_home_root(),
-                                       Path(target).absolute(), staged):
+                                       Path(target).absolute(), staged, **options):
         yield
 
 

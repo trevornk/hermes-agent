@@ -235,14 +235,18 @@ def _write_atomic(target: Path, write) -> Path | None:
     staging = target.with_name(f"{target.name}.stage.{os.getpid()}")
     try:
         write(staging)
-        os.replace(staging, target)
+        from pm.outer_transaction import publication
+        # Replace the directory entry, never write through an old venv symlink.
+        with publication(target, staging, replace_symlink=True):
+            os.replace(staging, target)
         return target
     except OSError:
+        return None
+    finally:
         try:
-            staging.unlink()
+            staging.unlink(missing_ok=True)
         except OSError:
             pass
-        return None
 
 
 def mint_launcher(
@@ -1083,8 +1087,8 @@ def _symlink_sealed_launchers(payload_bin) -> dict:
                     continue  # a live foreign link — user's arrangement
             elif target.exists():
                 continue  # a real file we did not write — never clobber
-            target.unlink(missing_ok=True)
-            target.symlink_to(source)
+            if _write_atomic(target, lambda staging: staging.symlink_to(source)) is None:
+                raise OSError(f"could not publish launcher {target}")
             written.append(name)
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
