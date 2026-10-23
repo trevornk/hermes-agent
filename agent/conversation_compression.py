@@ -496,6 +496,7 @@ class CompressionCommitFence:
         self._last_progress = time.monotonic()
         self._progress_observed = False
         self._deadline: float | None = None
+        self._idle_timeout_seconds: float | None = None
         self._retain_cancelled_lock_until_worker_done = False
         # Set once the active-row watermark is captured: later rows survive as tail, so hosts may keep admission.
         self._commit_watermark_fenced = False
@@ -530,6 +531,18 @@ class CompressionCommitFence:
         finally:
             self._lock.release()
 
+    def set_idle_timeout_seconds(self, seconds: float) -> None:
+        """Publish the host's no-progress budget for external compressors.
+
+        Unlike the total ceiling, this advances whenever provider output touches
+        the fence. It lets an external engine reserve time for a local fallback
+        before a silent host worker is cancelled.
+        """
+        seconds = float(seconds)
+        if seconds <= 0:
+            raise ValueError("compression idle timeout must be positive")
+        self._idle_timeout_seconds = seconds
+
     def touch_progress(self) -> None:
         """Record forward progress (a streamed token); a bare float store is atomic, so no lock."""
         self._last_progress = time.monotonic()
@@ -556,6 +569,23 @@ class CompressionCommitFence:
         waiting (see ``auxiliary_client.aux_stream_deadline``).
         """
         return self._deadline
+
+    @property
+    def compression_dispatch_deadline_monotonic(self) -> float | None:
+        """Earliest host cancellation boundary visible to an external compressor.
+
+        The total ceiling remains the stream-consumer deadline. This separate
+        value incorporates the host's progress-aware idle watchdog, whose first
+        silent provider call otherwise waits longer than the host will permit.
+        """
+        deadlines = [deadline for deadline in (
+            self._deadline,
+            (
+                self._last_progress + self._idle_timeout_seconds
+                if self._idle_timeout_seconds is not None else None
+            ),
+        ) if deadline is not None]
+        return min(deadlines) if deadlines else None
 
     def seconds_since_progress(self) -> float:
         """Seconds since the worker last reported forward progress."""
@@ -1227,6 +1257,7 @@ def run_compress_context_with_progress_timeout(
         idle = min(idle, ceiling)
     fence = fence if fence is not None else CompressionCommitFence()
     fence.set_precommit_deadline_monotonic(precommit_deadline_monotonic)
+    fence.set_idle_timeout_seconds(idle)
     # Read BEFORE this attempt runs: the host's ``stalled`` record and the cancelled worker's
     # ``stall_interrupted`` record both land during the unwind below, and this stall must not count as
     # One prior timeout-class failure = the route already burned a full idle window. An over-window request
@@ -1695,12 +1726,14 @@ def _compression_lock_holder(agent: Any) -> str:
 
 def _supported_compression_kwargs(
     compress_fn: Any, *, current_tokens: Optional[int], focus_topic: Optional[str], force: bool,
-    memory_context: str, bypass_cooldown: bool = False,
+    memory_context: str, bypass_cooldown: bool = False, deadline: Optional[float] = None,
 ) -> dict:
     """Return only compression kwargs accepted by an engine callable.
     Inspecting first keeps older plugin signatures compatible without catching ``TypeError`` and running a
     stateful compressor twice."""
     candidates = {"current_tokens": current_tokens, "focus_topic": focus_topic, "force": force}
+    if deadline is not None:
+        candidates["deadline"] = deadline
     if bypass_cooldown:
         candidates["bypass_cooldown"] = True
     if memory_context:
@@ -1712,7 +1745,9 @@ def _supported_compression_kwargs(
         # shape when the callable has no inspectable signature.
         return {"current_tokens": current_tokens}
     if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
-        return candidates
+        # ``deadline`` is an opt-in hint: a bare ``**kwargs`` signature (or a Mock's) does not
+        # declare it, so only an engine that NAMES the parameter receives it.
+        return {name: value for name, value in candidates.items() if name != "deadline" or name in parameters}
     return {name: value for name, value in candidates.items() if name in parameters}
 
 
@@ -2933,13 +2968,13 @@ def _pre_compress_memory_context(agent: Any, messages: list, checkpoint_required
 
 def _resolve_compress_call(
     agent: Any, *, approx_tokens: Optional[int], focus_topic: Optional[str], force: bool, memory_context: str,
-    bypass_cooldown: bool,
+    bypass_cooldown: bool, deadline: Optional[float] = None,
 ) -> tuple[Callable[..., Any], dict[str, Any]]:
     """Bind ``compress()`` and only the kwargs its signature accepts."""
     compress_fn = agent.context_compressor.compress
     compress_kwargs = _supported_compression_kwargs(
         compress_fn, current_tokens=approx_tokens, focus_topic=focus_topic, force=force, memory_context=memory_context,
-        bypass_cooldown=bypass_cooldown,
+        bypass_cooldown=bypass_cooldown, deadline=deadline,
     )
     if memory_context.strip() and "memory_context" not in compress_kwargs:
         engine_name = getattr(agent.context_compressor, "name", type(agent.context_compressor).__name__)
@@ -3519,6 +3554,30 @@ def _candidate_rejected(
                 _recorder("compaction returned the transcript unchanged (no_progress)")
         _emit_aborted_attempt_telemetry(agent, attempt.started_at, "no_progress", attempt.seed)
         return True
+    # External engines can return a semantically different replay without reducing the
+    # actual context burden (for example, rebuilding the same fresh tail around a new
+    # summary wrapper). Equality alone misses that case and lets an over-threshold host
+    # rewrite durable history on every turn. The built-in compressor already owns its
+    # own progress/salvage semantics, so this stricter cross-engine contract applies
+    # only to plugins.
+    from agent.context_compressor import ContextCompressor
+    _is_external_engine = not isinstance(agent.context_compressor, ContextCompressor)
+    _source_tokens = estimate_messages_tokens_rough(messages_before_compression)
+    _candidate_tokens = estimate_messages_tokens_rough(compressed)
+    if _is_external_engine and _candidate_tokens >= _source_tokens:
+        if messages != messages_before_compression:
+            messages[:] = copy.deepcopy(messages_before_compression)
+        logger.info(
+            "Compression made no material token reduction (session=%s, ~%s -> ~%s) — skipping boundary rewrite.",
+            agent.session_id or "none", f"{_source_tokens:,}", f"{_candidate_tokens:,}",
+        )
+        with _swallow('no-material-reduction backoff arm failed', exc_info=True):
+            if callable(_recorder := getattr(agent.context_compressor, "record_rejected_compaction", None)):
+                _recorder()
+            elif callable(_recorder := getattr(agent.context_compressor, "_record_structural_no_op", None)):
+                _recorder("compaction returned no material token reduction")
+        _emit_aborted_attempt_telemetry(agent, attempt.started_at, "no_material_reduction", attempt.seed)
+        return True
     if not compressed:
         logger.error(
             "context compression returned an empty transcript; refusing to rotate session=%s so the parent remains resumable",
@@ -3822,9 +3881,13 @@ def _run_summary_phase(
                 # compression flush skips it; run_agent marker sync realigns _session_messages.
                 agent._persist_user_message_idx = len(messages)
         memory_context = _pre_compress_memory_context(agent, messages, checkpoint_required)
+        _dispatch_deadline = (
+            commit_fence.compression_dispatch_deadline_monotonic
+            if commit_fence is not None else None
+        )
         compress_fn, compress_kwargs = _resolve_compress_call(
             agent, approx_tokens=approx_tokens, focus_topic=focus_topic, force=force, memory_context=memory_context,
-            bypass_cooldown=bypass_cooldown,
+            bypass_cooldown=bypass_cooldown, deadline=_dispatch_deadline,
         )
         messages_before_compression = copy.deepcopy(messages)
         _activity_heartbeat = _CompressionActivityHeartbeat(
