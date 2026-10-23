@@ -1254,6 +1254,48 @@ class TestAnthropicStreamCallbacks:
         assert "eager_input_streaming" not in seen_tools[0][0]
         assert seen_tools[1][0]["eager_input_streaming"] is False
 
+    def test_every_jiter_wording_is_treated_as_a_provider_stream_parse_error(self):
+        """anthropic-sdk-python#1265: the non-beta streaming accumulator lets the raw
+        ``jiter.from_json`` ValueError escape. jiter has at least eight distinct wordings and the
+        marker list only carried two, so a live ``expected `:` at line 1 column 1419`` was NOT
+        recognised as wire trouble -- it fell through to _is_local_validation_error() and activated
+        provider fallback against a perfectly healthy Anthropic. Every wording must retry instead.
+        """
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key", base_url="https://api.anthropic.com", model="claude-sonnet-4-5",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+        )
+        agent.api_mode = "anthropic_messages"
+
+        # Produced by probing jiter 0.15.0 with partial_mode=True, the mode the SDK uses.
+        jiter_wordings = [
+            "expected ident at line 1 column 11",
+            "expected value at line 1 column 11",
+            "expected `:` at line 1 column 1419",
+            "trailing comma at line 1 column 9",
+            "invalid escape at line 1 column 10",
+            "invalid number at line 1 column 8",
+            "key must be a string at line 1 column 2",
+            "unexpected end of hex escape at line 1 column 15",
+        ]
+        for wording in jiter_wordings:
+            assert agent._is_provider_stream_parse_error(ValueError(wording)), wording
+
+        # Guard the other direction: a genuine local bug has no trailing parser position and must
+        # stay local, or a real Hermes bug would be silently retried against the provider.
+        for local_bug in [
+            "unsupported operand type(s) for +: 'int' and 'str'",
+            "invalid literal for int() with base 10: 'abc'",
+            "Missing credentials for provider anthropic",
+        ]:
+            assert not agent._is_provider_stream_parse_error(ValueError(local_bug)), local_bug
+
+        # Non-Anthropic routes keep their historical handling regardless of wording.
+        agent.api_mode = "chat_completions"
+        assert not agent._is_provider_stream_parse_error(ValueError("expected `:` at line 1 column 1419"))
+
     def test_anthropic_partial_tool_names_do_not_survive_into_next_attempt(self):
         """A tool name from an attempt that died before any text is attempt-local: when the
         retry streams plain text and then drops, the partial stub must not blame ``old_tool``

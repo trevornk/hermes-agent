@@ -36,7 +36,26 @@ PROVIDER_STREAM_PARSE_MARKERS = (
 def is_provider_stream_parse_error(error: BaseException) -> bool:
     """True for a provider stream-parse ``ValueError`` (see ``PROVIDER_STREAM_PARSE_MARKERS``)."""
     return (isinstance(error, ValueError) and not isinstance(error, (UnicodeEncodeError, json.JSONDecodeError))
-            and any(marker in str(error).lower() for marker in PROVIDER_STREAM_PARSE_MARKERS))
+            and is_provider_stream_parse_message(str(error)))
+
+# The SDK accumulates streamed tool-call JSON with ``jiter.from_json(..., partial_mode=True)``
+# (anthropic/lib/streaming/_messages.py) and lets the raw parser ValueError escape — the non-beta
+# path has no try/except (anthropic-sdk-python#1265). jiter emits at least eight distinct wordings
+# ("expected `:`", "trailing comma", "invalid escape", "invalid number", "key must be a string",
+# "unexpected end of hex escape", ... ), so an explicit substring list silently misses variants:
+# only two of the eight were listed, which is why a mid-stream "expected `:` at line 1 column 1419"
+# was misrouted to provider fallback instead of the stream retry. Every jiter error is suffixed with
+# its position, so match that structurally. Callers gate on api_mode == "anthropic_messages" and
+# ValueError first, which keeps this from over-matching unrelated local errors.
+_PROVIDER_STREAM_PARSE_POSITION_RE = re.compile(r"at line \d+ column \d+\s*$")
+
+
+def is_provider_stream_parse_message(text: str) -> bool:
+    """True when ``text`` reads like a streamed-JSON parser failure from the provider wire."""
+    lowered = (text or "").strip().lower()
+    if any(marker in lowered for marker in PROVIDER_STREAM_PARSE_MARKERS):
+        return True
+    return bool(_PROVIDER_STREAM_PARSE_POSITION_RE.search(lowered))
 
 
 # Offline DNS failures are wrapped in a generic "Connection error" by SDKs — inspect the chain.
