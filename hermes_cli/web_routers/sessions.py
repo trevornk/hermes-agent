@@ -12,7 +12,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -736,6 +736,29 @@ def _project_for_display(messages: list, *, home=None, inline_images: bool = Tru
     return project_history_commentary(projected_messages, home=home)
 
 
+# [carried, dashboard_ws_handshake_offload.patch] Coalesce identical in-flight transcript
+# reads. The desktop re-requests the open session's history (include_compacted=true, which
+# scans every row of the session) on every reconnect; a reconnect loop stacked 14 copies of a
+# 44k-row read and saturated the default executor (ai-server 2026-09-05). Requests with the
+# same parameters now share one DB read.
+_inflight_message_reads: dict[tuple, "asyncio.Future"] = {}
+
+
+def _coalesced_to_thread(key: tuple, fn):
+    fut = _inflight_message_reads.get(key)
+    if fut is None or fut.done():
+        fut = asyncio.ensure_future(asyncio.to_thread(fn))
+        _inflight_message_reads[key] = fut
+
+        def _clear(f, _k=key):
+            if _inflight_message_reads.get(_k) is f:
+                _inflight_message_reads.pop(_k, None)
+
+        fut.add_done_callback(_clear)
+    # shield: one client disconnecting must not cancel the shared read.
+    return asyncio.shield(fut)
+
+
 @manage_router.get("/api/sessions/{session_id}/messages")
 async def get_session_messages(
     session_id: str, profile: Optional[str] = None, limit: Optional[int] = Query(None, ge=0),
@@ -764,7 +787,10 @@ async def get_session_messages(
             sid, limit=_limit, offset=offset, latest=latest_page,
             include_compacted=include_compacted, include_ancestors=True)
 
-    result = await asyncio.to_thread(_with_db, profile, _read, read_only=True)
+    result = await _coalesced_to_thread(
+        ("messages", profile, session_id, limit, offset, order, include_compacted),
+        lambda: _with_db(profile, _read, read_only=True),
+    )
     if result is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     sid, _limit, messages = result
