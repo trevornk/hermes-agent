@@ -1902,6 +1902,16 @@ def _deliver_result(
     delivery_errors = []
     suppressed_targets = 0  # local: `job` is snapshotted into durable deferred records mid-loop
     for target in targets:
+        if target['platform'] == 'desktop-owner':
+            from cron.desktop_origin import publish_completion
+            try:
+                receipt = publish_completion(job, content, for_failure=for_failure)
+                job['_origin_delivery_receipt'] = receipt
+                if receipt['status'] != 'delivered':
+                    unverified_targets.append('desktop-owner ' + receipt['status'] + ' (receipt ' + receipt['delivery_id'] + ')')
+            except Exception as exc:
+                delivery_errors.append('Desktop owner completion refused: ' + str(exc))
+            continue
         # A failure notice for a platform that hides warning notifications is a suppressed
         # disposition, not a send; requested (non-failure) results are never gated.
         from gateway.warning_notifications import warning_notifications_enabled

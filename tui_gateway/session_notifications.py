@@ -50,6 +50,8 @@ def _notif_resolve_event_key(evt_key: str, session: dict | None = None) -> str:
 def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) -> bool:
     """True if ``evt`` is owned by a *different* live session. Background completions carry the ``session_key`` of the
     session that started the work; async delegation completions also carry ``origin_ui_session_id`` (the live TUI tab)."""
+    if 'cron_origin' in evt:
+        return False  # the strict profile/principal/lineage gate below owns this producer
     evt_ui_sid = str(evt.get("origin_ui_session_id") or "")
     if evt_ui_sid:
         if evt_ui_sid == str(sid or "") and not session.get("_finalized"):
@@ -97,6 +99,10 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     resolved matches) — the fail-closed gate for addressed notifications, without the orphan-adoption fallback."""
     if session.get("_finalized"):
         return False
+    if 'cron_origin' in evt:
+        from cron.desktop_origin import belongs_to_session
+        from tui_gateway import server
+        return belongs_to_session(server, session, evt)
     # A completion replayed at process start has no in-process owner. A matching
     # persisted key alone can belong to a detached runtime whose old lease survived;
     # requiring a current client prevents it from spending a full model turn unseen.
@@ -585,6 +591,9 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
         # from the reaper, keeps its lease, and never reaches its bot mailbox again.
         _notif_release_turn(session)
         return
+    if 'cron_origin' in evt:
+        _notif_dispatch_cron_owner(sid, session, evt, text, claim)
+        return
     evt_type = evt.get("type")
     kwargs: dict = {}
     if evt_type == "async_delegation":
@@ -608,6 +617,38 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
         release_event_delivery(evt, claim)
         return
     complete_event_delivery(evt, claim)
+
+
+def _notif_dispatch_cron_owner(sid, session, event, text, claim):
+    from cron.desktop_origin import begin_followthrough, refund_unstarted, settle_followthrough
+    try:
+        if not begin_followthrough(event, claim):
+            _notif_release_turn(session)
+            return
+    except Exception:
+        _notif_release_turn(session)
+        from cron.desktop_origin import reconcile_start_failure, report_unknown
+        from tui_gateway import server
+        # A failed fence write is not a model start. Re-read committed state;
+        # if that read also fails, the durable pending/started obligation remains.
+        if reconcile_start_failure(event, claim) == 'started':
+            report_unknown(server, sid, session, event, claim)
+        raise
+    try:
+        accepted = _notif_submit('cron-owner:' + event['delegation_id'], sid, session, text,
+            'Native completion follow-through failed', display_kind='async_delegation_complete',
+            display_metadata=_async_delegation_display_metadata(event),
+            terminal_callback=lambda outcome: settle_followthrough(event, claim, outcome))
+        if not accepted:
+            refund_unstarted(event, claim)
+    except Exception:
+        # A start may have happened: report uncertainty without a duplicate model turn.
+        _notif_release_turn(session)
+        from cron.desktop_origin import report_unknown
+        from tui_gateway import server
+        # On notice-write failure leave 'started' for the existing poller's retry.
+        report_unknown(server, sid, session, event, claim)
+        raise
 
 
 def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, completions=None, *, owned=False) -> bool:
@@ -812,6 +853,9 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
             last_bot_poll = now
             try:
                 _poll_bot_completion_notice_once(sid, session)
+                from cron.desktop_origin import recover_interrupted
+                from tui_gateway import server
+                recover_interrupted(server, session, sid)
             except Exception:
                 logger.warning("Bot completion-notice poll failed", exc_info=True)
         # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
