@@ -15,6 +15,8 @@ maintenance, manual /compress; in-place and rotation) routes through, so the
 guard lives there, next to ``_ensure_compressed_has_user_turn``.
 """
 
+import logging
+
 import pytest
 
 from agent.context_compressor import SUMMARY_PREFIX
@@ -226,7 +228,7 @@ class TestEngineDropsReplyEndToEnd:
         # The tool rounds already live after the new user turn; the engine keeps them.
         messages += fold[1:]
 
-        with caplog.at_level("WARNING", logger="agent.conversation_compression_reply_anchor"):
+        with caplog.at_level("INFO", logger="agent.conversation_compression_reply_anchor"):
             live, _ = self._compress_and_read(db, session_id, agent, messages, tail_role="tool")
 
         # No legal slot: the reply is not recovered, the chain is untouched, and the skip is
@@ -235,9 +237,15 @@ class TestEngineDropsReplyEndToEnd:
         assert _count_reply(live) == 0
         assert all(m.get("tool_calls") for m in live if m.get("role") == "assistant")
         assert len([m for m in live if m.get("tool_calls")]) == len(call_ids)
-        assert any(
-            "not reinserting" in r.getMessage() and skip_reason in r.getMessage() for r in caplog.records
-        )
+        skips = [
+            r for r in caplog.records
+            if "not reinserting" in r.getMessage() and skip_reason in r.getMessage()
+        ]
+        assert skips
+        # A real user turn follows the reply here, so the reply is a PREVIOUS turn's and
+        # skipping it is expected; only an unlocatable slot (reused ids) stays a WARNING.
+        expected_level = logging.INFO if skip_reason == "strict role alternation" else logging.WARNING
+        assert {r.levelno for r in skips} == {expected_level}
 
     def test_older_assistant_at_slot_is_not_displaced(self, tmp_path):
         """The engine kept an older assistant row ("noted") right where the reply would go,
@@ -263,3 +271,73 @@ class TestEngineDropsReplyEndToEnd:
         # precedes the last "ok" that followed it).
         assert _count_reply(live) == 0
         assert live_contents.index("noted") < len(live_contents) - 1 == live_contents.index("ok")
+
+
+_ANCHOR_LOGGER = "agent.conversation_compression_reply_anchor"
+
+
+def _skip_records(caplog):
+    return [r for r in caplog.records if r.name == _ANCHOR_LOGGER and "not reinserting" in r.getMessage()]
+
+
+class TestAlternationSkipSeverity:
+    """The assistant-adjacent skip is expected for a PREVIOUS turn's reply (a real user turn
+    followed it, so the user is no longer reading it) and an anomaly only for the genuinely
+    just-delivered one. Behaviour is identical either way: the skip never inserts a row."""
+
+    @staticmethod
+    def _mid_turn_shape():
+        """Mid-turn (tool-loop) compaction: the last text-only assistant row is the PREVIOUS
+        turn's final answer; a real user turn and tool rounds follow it. The engine folded
+        everything up to the tool chain, whose first row is an assistant tool-call row."""
+        reply = {"role": "assistant", "content": "Final answer of the previous turn."}
+        original = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "first question"},
+            reply,
+            {"role": "user", "content": "second question: keep going"},
+            *_tool_chain("call_1", "call_2", "call_3"),
+        ]
+        compressed = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": SUMMARY_PREFIX + " earlier turns."},
+            *[dict(m) for m in original[4:]],
+        ]
+        return original, compressed
+
+    def test_previous_turn_reply_skip_is_info_not_warning(self, caplog):
+        original, compressed = self._mid_turn_shape()
+        before = [dict(m) for m in compressed]
+
+        with caplog.at_level("INFO", logger=_ANCHOR_LOGGER):
+            inserted = _ensure_compressed_keeps_last_assistant_reply(original, compressed, session_id="s")
+
+        assert inserted is None
+        assert compressed == before, "the skip must leave the transcript untouched"
+        skips = _skip_records(caplog)
+        assert [r.levelno for r in skips] == [logging.INFO]
+        message = skips[0].getMessage()
+        assert "previous turn" in message and "strict role alternation" in message
+        assert "just-delivered" not in message, "a previous turn's reply is not the just-delivered one"
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_just_delivered_reply_with_nonmatching_assistant_slot_still_warns(self, caplog):
+        """Idle/maintenance compaction right after the reply: no user turn follows it, so a
+        surviving non-matching assistant row (the engine's paraphrase) is a real anomaly."""
+        reply = {"role": "assistant", "content": "x " * 400}
+        original = [{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}, reply]
+        compressed = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "[summary]"},
+            {"role": "assistant", "content": "engine paraphrase"},
+        ]
+        before = [dict(m) for m in compressed]
+
+        with caplog.at_level("INFO", logger=_ANCHOR_LOGGER):
+            inserted = _ensure_compressed_keeps_last_assistant_reply(original, compressed, session_id="s")
+
+        assert inserted is None
+        assert compressed == before
+        skips = _skip_records(caplog)
+        assert [r.levelno for r in skips] == [logging.WARNING]
+        assert "just-delivered" in skips[0].getMessage()
