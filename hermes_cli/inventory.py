@@ -1097,7 +1097,9 @@ def _moa_provider_row(current_provider: str = "") -> dict | None:
         from hermes_cli.moa_config import normalize_moa_config
 
         cfg = normalize_moa_config(load_config().get("moa") or {})
-        models = list(cfg.get("presets", {}).keys())
+        # Skip disabled presets, as exact_moa_preset_name does (#55187): the
+        # built-in ``default`` can't be deleted, only disabled.
+        models = [n for n, p in cfg.get("presets", {}).items() if p.get("enabled", True)]
         if not models:
             return None
         return _row(

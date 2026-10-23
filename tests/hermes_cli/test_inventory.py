@@ -818,3 +818,31 @@ def test_apply_limits_skips_window_plan_rows():
         inventory._apply_limits(rows)
     assert "limit" not in rows[0]
     assert rows[1]["limit"]["scope"] == "account"
+
+
+# ─── _moa_provider_row ───────────────────────────────────────────────
+
+
+def _moa_cfg(**enabled: bool) -> dict:
+    slot = {"provider": "anthropic", "model": "m"}
+    return {"moa": {"presets": {
+        n: {"enabled": e, "reference_models": [slot], "aggregator": slot}
+        for n, e in enabled.items()
+    }}}
+
+
+def test_moa_provider_row_hides_disabled_presets():
+    from hermes_cli.inventory import _moa_provider_row
+
+    with patch("hermes_cli.config.load_config", return_value=_moa_cfg(default=False, council=True)):
+        row = _moa_provider_row("moa")
+    assert row["models"] == ["council"]
+    assert row["total_models"] == 1
+    assert row["is_current"] is True
+
+
+def test_moa_provider_row_none_when_all_presets_disabled():
+    from hermes_cli.inventory import _moa_provider_row
+
+    with patch("hermes_cli.config.load_config", return_value=_moa_cfg(default=False)):
+        assert _moa_provider_row() is None
