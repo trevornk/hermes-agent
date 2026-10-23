@@ -114,6 +114,19 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     cc = getattr(agent, "context_compressor", None)
     if cc is None:
         return
+    # External context engines (context.engine: <plugin>, e.g. hermes-lcm) own their own
+    # compaction policy end-to-end — the host's compression.* tuning never reaches them
+    # (see agent/agent_init.py::_build_context_engine and fix 60391d0eef1 for the same
+    # host-contract boundary). Everything below this guard pokes ContextCompressor-private
+    # attributes/methods (_coerce_threshold_tokens_cap, _effective_threshold_percent,
+    # tail_mode, proactive_prune_*, ...) that a plugin engine does not implement and must
+    # not have overwritten. Mirrors the isinstance guard already used at the two other
+    # call sites that touch ContextCompressor-private state
+    # (tools/delegate_tool.py::_apply_child_compression_cap,
+    # agent/conversation_compression.py::_capture_authoritative_cooldown_under_lease).
+    from agent.context_compressor import ContextCompressor
+    if not isinstance(cc, ContextCompressor):
+        return
     # tail_mode: unknown/absent values land on the ctor default ("lean"), matching agent_init.
     default_tail = str(_compressor_ctor_default("tail_mode", "lean"))
     mode = str(compression.get("tail_mode", default_tail) or default_tail).strip().lower()
