@@ -140,7 +140,16 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     # Canonical route reader shared with CLI --resume: nested ``gateway_runtime`` (the route the messaging
     # gateway last ran) before the TUI's top-level keys, then a routable ``billing_provider`` (#125942).
     from hermes_state import SessionDB
-    route = SessionDB.session_gateway_runtime(row)
+    config_model = str(model_config.get("model") or "").strip()
+    route_row = row
+    if config_model and model and config_model != model:
+        # A top-level route for another model must not be paired with the row's model.
+        # Preserve the canonical reader's newer nested gateway-runtime precedence.
+        model_config = {k: v for k, v in model_config.items() if k not in ("provider", "base_url", "api_mode")}
+        route_row = {**row, "model_config": model_config}
+        logger.info("session %s: ignoring stale top-level route for %r (model is %r)",
+                    row.get("id"), config_model, model)
+    route = SessionDB.session_gateway_runtime(route_row)
     provider, base_url, api_mode = (str(route.get(k) or "").strip() for k in ("provider", "base_url", "api_mode"))
     service_tier = str(model_config.get("service_tier") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
