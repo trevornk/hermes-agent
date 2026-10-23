@@ -28,10 +28,18 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.image_gen_provider import DEFAULT_ASPECT_RATIO, resolve_aspect_ratio, save_b64_image, success_response
 from plugins.image_gen._common import (
     GPT_IMAGE_2_API_MODEL as API_MODEL, GPT_IMAGE_2_DEFAULT as DEFAULT_MODEL, GPT_IMAGE_2_TIERS,
-    StaticImageGenProvider, collect_source_images, error_factory, prompt_required_error,
-    resolve_static_model, size_for)
+    GPT_IMAGE_25_TIERS, StaticImageGenProvider, collect_source_images, error_factory,
+    prompt_required_error, resolve_static_model, size_for)
 
 logger = logging.getLogger(__name__)
+
+# [carried, codex_image_gen_25.patch] Same catalog as the API-key plugin: the native Codex
+# images endpoint takes the image model as a request field, so Codex OAuth reaches GPT Image
+# 2.5 Flare/Sunburst too, not just gpt-image-2.
+MODELS = {
+    **{key: {**meta, "api_model": API_MODEL} for key, meta in GPT_IMAGE_2_TIERS.items()},
+    **GPT_IMAGE_25_TIERS,
+}
 
 _MAX_ERROR_BODY_CHARS = 500
 
@@ -61,7 +69,7 @@ def _summarize_error_body(body: str) -> str:
 
 def _resolve_model() -> tuple[str, dict[str, Any]]:
     return resolve_static_model(
-        GPT_IMAGE_2_TIERS, DEFAULT_MODEL, env_var="OPENAI_IMAGE_MODEL", config_key="openai-codex")
+        MODELS, DEFAULT_MODEL, env_var="OPENAI_IMAGE_MODEL", config_key="openai-codex")
 
 
 def _read_codex_credential() -> tuple[Optional[str], Optional[str]]:
@@ -174,13 +182,14 @@ def _normalize_input_images(
 
 
 def _build_image_request(
-    *, prompt: str, size: str, quality: str, input_images: Optional[list[dict[str, str]]] = None
+    *, prompt: str, size: str, quality: str, input_images: Optional[list[dict[str, str]]] = None,
+    api_model: str = API_MODEL,
 ) -> tuple[str, dict[str, Any]]:
     """``(endpoint_path, json_body)`` — ``images/edits`` when sources are present, else
     ``images/generations``. Field set mirrors the official client's ``ImageGenerationRequest`` /
     ``ImageEditRequest``."""
     body: dict[str, Any] = {
-        "prompt": prompt, "model": API_MODEL, "n": 1, "quality": quality, "size": size,
+        "prompt": prompt, "model": api_model, "n": 1, "quality": quality, "size": size,
         "background": "opaque",
     }
     if input_images:
@@ -192,6 +201,7 @@ def _build_image_request(
 def _post_image_request(
     token: str, *, prompt: str, size: str, quality: str, input_images: Optional[list[dict[str, str]]] = None,
     base_url: str,
+    api_model: str = API_MODEL,
 ) -> dict[str, Any]:
     """POST to the native Codex images endpoint; return the decoded JSON body plus
     ``imagegen_request_id`` (backend correlation id, for support tickets).
@@ -207,7 +217,8 @@ def _post_image_request(
         "Content-Type": "application/json",
         "x-codex-image-turn-id": str(uuid.uuid4()),
     })
-    path, body = _build_image_request(prompt=prompt, size=size, quality=quality, input_images=input_images)
+    path, body = _build_image_request(
+        prompt=prompt, size=size, quality=quality, input_images=input_images, api_model=api_model)
     timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=60.0, pool=30.0)
     with httpx.Client(timeout=timeout, headers=headers) as http:
         response = http.post(f"{base_url}/{path}", json=body)
@@ -233,11 +244,11 @@ def _png_pixel_size(raw: bytes) -> Optional[str]:
 
 
 class OpenAICodexImageGenProvider(StaticImageGenProvider):
-    """gpt-image-2 routed through ChatGPT/Codex OAuth instead of an API key."""
+    """gpt-image-2 / gpt-image-2.5 routed through ChatGPT/Codex OAuth instead of an API key."""
 
     provider_id = "openai-codex"
     label = "OpenAI (Codex auth)"
-    models = GPT_IMAGE_2_TIERS
+    models = MODELS
     default_model_id = DEFAULT_MODEL
     price = "varies"
 
@@ -248,7 +259,8 @@ class OpenAICodexImageGenProvider(StaticImageGenProvider):
         return {
             "name": "OpenAI (Codex auth)",
             "badge": "free",
-            "tag": "gpt-image-2 via ChatGPT/Codex OAuth — no API key required; supports text and image inputs",
+            "tag": ("gpt-image-2 & gpt-image-2.5 Flare/Sunburst via ChatGPT/Codex OAuth — "
+                    "no API key required; supports text and image inputs"),
             "env_vars": [],
             # Empty env_vars means the picker writes the selection without a credential prompt; the shared
             # Codex OAuth bootstrap hook (hermes_cli/tools_config_post_setup.py) starts the sign-in (#102144).
@@ -288,7 +300,7 @@ class OpenAICodexImageGenProvider(StaticImageGenProvider):
         try:
             payload = _post_image_request(
                 token, prompt=prompt, size=size, quality=meta["quality"], input_images=input_images or None,
-                base_url=base_url)
+                base_url=base_url, api_model=meta.get("api_model", API_MODEL))
         except Exception as exc:
             logger.debug("Codex image generation failed", exc_info=True)
             return fail(f"OpenAI image generation via Codex auth failed: {exc}", "api_error")
