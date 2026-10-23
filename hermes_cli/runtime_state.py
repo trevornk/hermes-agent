@@ -186,9 +186,16 @@ def lease_directory(generation: Path) -> Callable[[], None]:
 
 
 def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> list[Path]:
-    """Remove unselected lease-managed generations after their readers exit."""
+    """Remove unselected lease-managed generations after their readers exit.
+
+    Never inside an outer safe-update transaction: its rollback still guards every generation
+    it captured (venv_sync.collect_superseded_generations skips too; this covers ``pm gc``).
+    """
     from pm.environments import selected_venv
+    from pm.outer_transaction import active
     removed = []
+    if active():
+        return removed
     root = install_state_dir(project)
     if not root.exists():
         return removed

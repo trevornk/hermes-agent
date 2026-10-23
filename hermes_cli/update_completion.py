@@ -545,7 +545,30 @@ def _finish(request: dict, result_path: Path) -> int:
     return code
 
 
+#: Set by an outer safe-update beside ``HERMES_DISABLE_LAZY_INSTALLS`` for the pre-swap updater
+#: only: the staged merge-base tree's launcher must not finish "its" update (sync, collection,
+#: builds) unattributed before this tree takes over. This process is the first one of the new tree.
+PRE_SWAP_LAUNCH_GUARD = "HERMES_UPDATE_PRE_SWAP_LAUNCH_GUARD"
+
+
+def lift_pre_swap_launch_guard(environ=None) -> bool:
+    """Drop the outer updater's pre-swap launch guard; True when one was set.
+
+    The guard's job ended when the tree moved: the dependency sync, the generation collection and
+    the product builds below are this update's own explicit work and run under the producer handoff,
+    so the lazy-install bridge var must not reach them (it would skip default-tool preparation and
+    make the Node dependency step refuse to install). Without the guard variable nothing changes:
+    a Docker image or test harness that set ``HERMES_DISABLE_LAZY_INSTALLS`` itself keeps it.
+    """
+    environ = os.environ if environ is None else environ
+    if environ.pop(PRE_SWAP_LAUNCH_GUARD, None) is None:
+        return False
+    environ.pop("HERMES_DISABLE_LAZY_INSTALLS", None)
+    return True
+
+
 def main() -> int:
+    lift_pre_swap_launch_guard()
     request_path, result_path = map(Path, sys.argv[1:3])
     request = json.loads(request_path.read_text(encoding="utf-8-sig"))
     if request["schema"] != 1:
