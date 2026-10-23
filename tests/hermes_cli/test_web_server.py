@@ -1248,14 +1248,16 @@ CONFIG_SCHEMA = ProviderConfigSchema(
 
         calls = []
 
-        def fake_spawn(subcommand, name, *, env_overrides=None):
-            calls.append((subcommand, name, env_overrides))
+        def fake_spawn(subcommand, name, *, env_overrides=None, cmd_override=None):
+            calls.append((subcommand, name, env_overrides, cmd_override))
             return Proc()
 
         monkeypatch.setattr(_web_server_files, "_dashboard_local_update_managed_externally", lambda: False)
         monkeypatch.setattr(_cfg_mod, "detect_install_method", lambda _root: "git")
         monkeypatch.setattr(web_server.secrets, "token_hex", lambda _size: "a" * 32)
         monkeypatch.setattr(_web_server_gateway, "_spawn_hermes_action", fake_spawn)
+        # No sanctioned wrapper on this test host — cmd_override must resolve to None.
+        monkeypatch.setattr("os.path.exists", lambda _path: False)
         _web_server_gateway._ACTION_PROCS.pop("hermes-update", None)
         _web_server_gateway._ACTION_RESULTS.pop("hermes-update", None)
 
@@ -1269,7 +1271,7 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             "action_id": "a" * 32,
         }
         assert calls == [
-            (["update"], "hermes-update", {"HERMES_ACTION_ID": "a" * 32})
+            (["update"], "hermes-update", {"HERMES_ACTION_ID": "a" * 32}, None)
         ]
 
     def test_update_hermes_reuses_running_action(self, monkeypatch):
@@ -1304,6 +1306,114 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             "already_running": True,
             "action_id": "b" * 32,
         }
+
+    def test_update_hermes_routes_through_safe_wrapper_when_present(self, monkeypatch):
+        """[carried] desktop_update_use_safe_wrapper: when
+        ~/.hermes/scripts/hermes-safe-update.sh exists, the dashboard 'Update now'
+        button must spawn that script (which pauses LaunchDaemons first) instead of
+        raw `python -m hermes_cli.main update` — see the 2026-07-31 credential-loss
+        incident referenced in gateway/AGENTS.md."""
+        from hermes_cli import web_server
+
+        calls = []
+
+        class Proc:
+            pid = 55555
+
+        def fake_spawn(subcommand, name, *, env_overrides=None, cmd_override=None):
+            calls.append((subcommand, name, env_overrides, cmd_override))
+            return Proc()
+
+        monkeypatch.setattr(_web_server_files, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(_cfg_mod, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(web_server.secrets, "token_hex", lambda _size: "c" * 32)
+        monkeypatch.setattr(_web_server_gateway, "_spawn_hermes_action", fake_spawn)
+        monkeypatch.setattr(
+            "os.path.exists",
+            lambda path: str(path).endswith("/scripts/hermes-safe-update.sh"),
+        )
+        _web_server_gateway._ACTION_PROCS.pop("hermes-update", None)
+        _web_server_gateway._ACTION_RESULTS.pop("hermes-update", None)
+
+        from hermes_constants import get_hermes_home as _ghh
+        _expected_wrapper = os.path.join(str(_ghh()), "scripts", "hermes-safe-update.sh")
+
+        resp = self.client.post("/api/hermes/update")
+
+        assert resp.status_code == 200
+        assert resp.json()["pid"] == 55555
+        assert calls == [
+            (
+                ["update"], "hermes-update", {"HERMES_ACTION_ID": "c" * 32},
+                ["/bin/bash", _expected_wrapper],
+            )
+        ]
+
+    def test_update_hermes_uses_raw_cli_when_no_safe_wrapper_installed(self, monkeypatch):
+        """NEGATIVE case for the safe-wrapper carry: an install without the
+        ai-server-specific wrapper script keeps the original raw `hermes update`
+        behavior — cmd_override must resolve to None, not to a nonexistent path."""
+        from hermes_cli import web_server
+
+        calls = []
+
+        class Proc:
+            pid = 66666
+
+        def fake_spawn(subcommand, name, *, env_overrides=None, cmd_override=None):
+            calls.append((subcommand, name, env_overrides, cmd_override))
+            return Proc()
+
+        monkeypatch.setattr(_web_server_files, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(_cfg_mod, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(web_server.secrets, "token_hex", lambda _size: "d" * 32)
+        monkeypatch.setattr(_web_server_gateway, "_spawn_hermes_action", fake_spawn)
+        monkeypatch.setattr("os.path.exists", lambda _path: False)
+        _web_server_gateway._ACTION_PROCS.pop("hermes-update", None)
+        _web_server_gateway._ACTION_RESULTS.pop("hermes-update", None)
+
+        resp = self.client.post("/api/hermes/update")
+
+        assert resp.status_code == 200
+        assert resp.json()["pid"] == 66666
+        assert calls == [
+            (["update"], "hermes-update", {"HERMES_ACTION_ID": "d" * 32}, None)
+        ]
+
+
+
+    def _schema_provider_options(self, key):
+        resp = self.client.get("/api/config/schema")
+        assert resp.status_code == 200
+        return resp.json()["fields"][key]["options"]
+
+
+
+
+
+
+
+    def test_platform_scoped_messaging_env_vars_are_channel_managed(self):
+        """Platform-scoped vars belong to a Channels card; cross-cutting
+        gateway vars belong to the Keys page.
+
+        Uses credentials as the example: the self-configuring knobs
+        (*_HOME_CHANNEL, *_ALLOW_ALL_USERS, …) were deliberately dropped from
+        the setup cards and handed back to Keys — see
+        tests/hermes_cli/test_setup_hidden_env.py.
+        """
+        from hermes_cli.web_server_messaging import _MESSAGING_KEYS_PAGE_KEYS, _build_catalog_entry, _channel_managed_env_keys
+
+        discord = _build_catalog_entry("discord")
+        assert "DISCORD_BOT_TOKEN" in discord["env_vars"]
+        assert "DISCORD_ALLOWED_USERS" in discord["env_vars"]
+
+        managed = _channel_managed_env_keys()
+        assert "DISCORD_BOT_TOKEN" in managed
+        assert "MATTERMOST_TOKEN" in managed
+        assert "GATEWAY_PROXY_URL" not in managed
+        assert "GATEWAY_PROXY_URL" in _MESSAGING_KEYS_PAGE_KEYS
+
 
 
     def test_model_set_maps_unknown_vendor_to_aggregator(self, monkeypatch):

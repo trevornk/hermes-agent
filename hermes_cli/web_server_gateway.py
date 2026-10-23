@@ -473,9 +473,16 @@ def _action_targets_system_gateway(subcommand: list[str]) -> bool:
 
 
 def _spawn_hermes_action(
-    subcommand: list[str], name: str, *, env_overrides: Optional[dict[str, str]] = None
+    subcommand: list[str], name: str, *, env_overrides: Optional[dict[str, str]] = None,
+    cmd_override: Optional[list[str]] = None,
 ) -> subprocess.Popen:
-    """Spawn ``hermes <subcommand>`` detached (via ``hermes_cli.main``) and record the handle."""
+    """Spawn ``hermes <subcommand>`` detached (via ``hermes_cli.main``) and record the handle.
+
+    ``cmd_override``, when given, replaces the derived ``hermes <subcommand>`` argv entirely
+    (e.g. to spawn a wrapper script instead of the raw CLI) while keeping the same log file /
+    ``_ACTION_PROCS`` / ``_ACTION_COMMANDS`` bookkeeping, so status polling for ``name`` keeps
+    working unmodified.
+    """
     from hermes_cli.web_server import PROJECT_ROOT
     _ACTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = open(_ACTION_LOG_DIR / _ACTION_LOG_FILES[name], "ab", buffering=0)
@@ -491,7 +498,7 @@ def _spawn_hermes_action(
         _atomic_bytes(_ACTION_LOG_DIR / f"{name}.action_id", action_id.encode("ascii"))
 
     from hermes_cli._launchers import runtime_command
-    cmd = runtime_command(PROJECT_ROOT, subcommand)
+    cmd = cmd_override or runtime_command(PROJECT_ROOT, subcommand)
     if _action_targets_system_gateway(subcommand):
         # A system-scope lifecycle verb spawned as the dashboard's own user can only ever write
         # "System gateway <verb> requires root" into this log, so the button never worked on a
