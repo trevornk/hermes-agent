@@ -260,7 +260,7 @@ class TestAnthropicCompletionsAdapterUsageConstruction:
                 return False
 
             def __iter__(self):
-                return iter(())
+                return iter((SimpleNamespace(type="message_stop"),))
 
             def get_final_message(self):
                 return self._final
