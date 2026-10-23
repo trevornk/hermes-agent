@@ -46,10 +46,17 @@ def _parse_codex_final_response(
     usage = None
     resp_usage = getattr(final, "usage", None)
     if resp_usage:
-        def _u(key: str) -> int:
-            return getattr(resp_usage, key, 0) or (resp_usage.get(key, 0) if isinstance(resp_usage, dict) else 0)
+        from agent.auxiliary_client import _aux_usage_field, _extract_cached_token_details
+
+        cached, written = _extract_cached_token_details(resp_usage)
+        details = SimpleNamespace(cached_tokens=cached, cache_write_tokens=written)
         usage = SimpleNamespace(
-            prompt_tokens=_u("input_tokens"), completion_tokens=_u("output_tokens"),
-            total_tokens=_u("total_tokens"))
+            prompt_tokens=_aux_usage_field(resp_usage, "input_tokens"),
+            completion_tokens=_aux_usage_field(resp_usage, "output_tokens"),
+            total_tokens=_aux_usage_field(resp_usage, "total_tokens"),
+            input_tokens=_aux_usage_field(resp_usage, "input_tokens"),
+            output_tokens=_aux_usage_field(resp_usage, "output_tokens"),
+            prompt_tokens_details=details, input_tokens_details=details,
+        )
     return text_parts, tool_calls_raw, usage, finish_reason
 

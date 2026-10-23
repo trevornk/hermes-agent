@@ -1142,6 +1142,93 @@ def _attempt_stream_socket(stream: Any) -> Any:
     return _socket_from_stream(network_stream) if network_stream is not None else None
 
 
+# ── Auxiliary usage-shape helpers ──────────────────────────────────────────
+# The adapters below rebuild a chat.completions-shaped usage object. Earlier
+# versions emitted only prompt/completion/total, which silently dropped the
+# cache breakdown, so every adapter-path aux call was recorded (and priced) as
+# fully uncached while the main-loop client path recorded cache correctly.
+# aux_accounting.record_aux_usage() calls normalize_usage() WITHOUT an
+# api_mode (see agent/aux_accounting.py), so it always resolves through
+# _CHAT_USAGE_SHAPE regardless of the originating adapter — these helpers read
+# a raw SDK usage object OR a plain dict and emit BOTH the Responses-style
+# nested detail (input_tokens_details) and the OpenAI chat-style nested detail
+# (prompt_tokens_details) so normalize_usage()'s chat-shape lookup finds the
+# cache breakdown either way. They never raise — they sit in the
+# response-construction path, where an exception would break the aux call
+# itself, not just its accounting.
+
+
+def _aux_usage_field(usage: Any, name: str) -> int:
+    """Read an int field from an SDK usage object or dict. Never raises."""
+    try:
+        val = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+        return int(val or 0)
+    except Exception:
+        # `name` is always one of a small set of literal field names passed by
+        # call sites (never derived from the usage payload) — safe to log. The
+        # usage object/value/exception text are NOT logged: a malformed SDK
+        # usage object could be a proxy wrapping request/response internals
+        # that may carry credentials, so only a static diagnostic + the known
+        # field name are emitted, never the offending value or traceback.
+        logger.debug("aux usage: field read/convert failed for %s; defaulting to 0", name)
+        return 0
+
+
+def _first_nonzero(usage: Any, *names: str) -> int:
+    """First non-zero field among *names*, else 0."""
+    for n in names:
+        v = _aux_usage_field(usage, n)
+        if v:
+            return v
+    return 0
+
+
+def _extract_cached_token_details(usage: Any) -> tuple[int, int]:
+    """Return ``(cache_read, cache_write)`` from any usage shape.
+
+    Reads Codex Responses ``input_tokens_details``, OpenAI chat
+    ``prompt_tokens_details``, and top-level names used by Anthropic and
+    proxy-flattened endpoints. Each bucket is resolved independently: a nested
+    read must not mask a top-level write. Missing fields yield 0.
+    """
+    if usage is None:
+        return (0, 0)
+    sources = [usage]
+    for attr in ("input_tokens_details", "prompt_tokens_details"):
+        # Malformed/exotic SDK usage objects (proxies, pydantic models whose
+        # validators raise on access, ...) can raise something other than
+        # AttributeError here; this helper documents "never raises" (it sits
+        # in the response-construction path, where an exception would break
+        # the aux call itself, not just its accounting) so the read must be
+        # guarded the same way the sibling _aux_usage_field already is.
+        # A benign absence (attribute/key genuinely missing on this usage
+        # shape) is expected and stays quiet — only a genuine exception during
+        # the read gets a diagnostic. `attr` is always one of the two literal
+        # names above (never derived from the usage payload), so it's safe to
+        # log; the usage object/value/exception text/traceback are never
+        # logged (a malformed usage object could be a proxy carrying request
+        # internals that may hold credentials).
+        try:
+            det = usage.get(attr) if isinstance(usage, dict) else getattr(usage, attr, None)
+            if det:
+                sources.append(det)
+        except Exception:
+            # Covers both the read itself and a `det.__bool__()` that raises
+            # (an exotic SDK/proxy object can make truthiness itself explode,
+            # not just attribute access) — either way this boundary must not
+            # propagate, per the "never raises" contract above.
+            logger.debug("aux usage: nested-detail read failed for %s; defaulting to absent", attr)
+    read = write = 0
+    for src in sources:
+        read = read or _first_nonzero(src, "cached_tokens", "cache_read_input_tokens")
+        write = write or _first_nonzero(
+            src, "cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens"
+        )
+    return (read, write)
+
+
+
+
 def _close_quietly(target: Any, failure_note: Optional[str]) -> None:
     """Call ``target.close()`` if present; a failure is debug-logged under ``failure_note`` (silent when None)."""
     close = getattr(target, "close", None)
@@ -1801,11 +1888,26 @@ class _AnthropicCompletionsAdapter:
         _nr = get_transport("anthropic_messages").normalize_response(response, strip_tool_prefix=self._is_oauth)
         usage = None
         if hasattr(response, "usage") and response.usage:
-            prompt_tokens = getattr(response.usage, "input_tokens", 0) or 0
-            completion_tokens = getattr(response.usage, "output_tokens", 0) or 0
+            # Anthropic's input_tokens EXCLUDES cache; OpenAI's prompt_tokens
+            # INCLUDES it. Emit both conventions so normalize_usage() is right
+            # regardless of which shape it resolves to (see
+            # _extract_cached_token_details above) — aux accounting calls
+            # normalize_usage() without api_mode, so it always uses the
+            # OpenAI-chat shape even for Anthropic-sourced usage.
+            input_tokens = _aux_usage_field(response.usage, "input_tokens")
+            completion_tokens = _aux_usage_field(response.usage, "output_tokens")
+            cache_read, cache_write = _extract_cached_token_details(response.usage)
+            prompt_tokens = input_tokens + cache_read + cache_write
+            # total must stay consistent with the INCLUSIVE prompt it ships
+            # beside; Anthropic sends no total of its own.
+            total_tokens = (
+                _aux_usage_field(response.usage, "total_tokens") or prompt_tokens + completion_tokens
+            )
             usage = SimpleNamespace(
                 prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-                total_tokens=getattr(response.usage, "total_tokens", 0) or (prompt_tokens + completion_tokens),
+                total_tokens=total_tokens,
+                input_tokens=input_tokens, output_tokens=completion_tokens,
+                cache_read_input_tokens=cache_read, cache_creation_input_tokens=cache_write,
             )
         # ToolCall already duck-types as OpenAI shape via properties.
         choice = SimpleNamespace(
