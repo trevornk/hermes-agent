@@ -72,8 +72,36 @@ _PATTERNS: list[tuple[str, str, str]] = [
     # The var name ends with \b so benign names containing KEY/TOKEN as substrings
     # ($TRILLIUM_ETAPI_URL) pass. API is deliberately absent: mid-name API is ubiquitous in
     # benign vars, and every real secret it caught ($OPENAI_API_KEY) already ends in KEY/TOKEN.
-    (rf'curl\s+[^\n]{{0,2048}}{_SECRET_VAR}', "exfil_curl", "all"),
-    (rf'wget\s+[^\n]{{0,2048}}{_SECRET_VAR}', "exfil_wget", "all"),
+    #
+    # [carried, exfil_precision.patch] Added `(?!["\'])` to both broad rules, and
+    # added the two position-aware rules below them.
+    #
+    # Upstream's \b anchoring fixed benign *variable-name* false positives
+    # ($TRILLIUM_ETAPI_URL). It does not fix the bigger one: passing a token
+    # as an Authorization header to a known API host is the *correct* way to
+    # use a secret and is what essentially every infra doc shows, yet
+    # `curl -sS -H "Authorization: Bearer ***" https://api...`
+    # still matched (verified empirically against upstream v2026.8.31). The
+    # rule then fires on legitimate AGENTS.md / CLAUDE.md content and blocks
+    # the whole file — the same failure mode documented for "praxis" above.
+    # A rule that fires on correct usage trains readers to ignore it, which
+    # is worse than not having it.
+    #
+    # The `(?!["\'])` lookahead keys on where THE SECRET ITSELF sits: a
+    # secret consumed as a header value is closed by the quote that ends the
+    # -H argument, whereas an exfiltrated secret is a bare argument or sits
+    # in a URL/body. This is deliberately NOT "skip any line containing an
+    # auth header" — that would be bypassed by appending a dummy header.
+    # Appending a header elsewhere does not change where the real secret
+    # sits, so the rules below still fire (see the auth-header evasion tests).
+    (rf'curl\s+[^\n]{{0,2048}}{_SECRET_VAR}(?!["\'])', "exfil_curl", "all"),
+    (rf'wget\s+[^\n]{{0,2048}}{_SECRET_VAR}(?!["\'])', "exfil_wget", "all"),
+    # Secret disclosed to the remote host: interpolated into the URL, or sent
+    # in a POST body/form. These stay precise even when an auth header is
+    # present on the same command line, so a throwaway header cannot mask a
+    # real exfiltration.
+    (r'(?:curl|wget)\s+[^\n]{0,2048}https?://[^\s\'"]*\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)S?\b', "exfil_url_secret", "all"),
+    (r'(?:curl|wget)\s+[^\n]{0,2048}(?:-d|--data(?:-raw|-binary|-urlencode)?|-F|--form|--post-data)[\s=]+[\'"]?[^\n]{0,200}\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)S?\b', "exfil_body_secret", "all"),
     (r'cat\s+[^\n]{0,2048}(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)', "read_secrets", "all"),
     (r'(send|post|upload|transmit)\s+[^\n]{0,2048}\s+(to|at)\s+https?://', "send_to_url", "strict"),
     (rf'(include|output|print|share)\s+{_FILLER}(conversation|chat\s+history|previous\s+messages|full\s+context|entire\s+context)', "context_exfil", "strict"),
