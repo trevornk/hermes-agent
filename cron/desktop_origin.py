@@ -242,6 +242,35 @@ def report_unknown(server, sid, session, event, claim):
     server._emit('cron.completion', sid, {'text': notice, 'id': key + '-unknown'})
 
 
+
+def pending_for_session(server, session):
+    """Read this owner's pending receipts independently of the process-wide offer queue.
+
+    Another profile's consumer can take and return every shared-queue offer before
+    this poller wakes. Reading the durable row here provides bounded progress; the
+    existing delivery claim remains the sole admission/deduplication authority.
+    """
+    if session.get('running') or session.get('_finalized'):
+        return []
+    from tools import async_delegation as ledger
+    # Never let an unbound caller read a different home's completion payloads.
+    if server._session_home(session).resolve() != get_hermes_home().resolve():
+        return []
+    with ledger._DB_LOCK, ledger._transaction() as conn:
+        rows = conn.execute("""WITH RECURSIVE lineage(id) AS (SELECT ? UNION
+            SELECT s.parent_session_id FROM sessions s JOIN lineage l ON s.id=l.id
+            JOIN sessions p ON p.id=s.parent_session_id WHERE p.end_reason='compression')
+            SELECT event_json FROM async_delegations
+            WHERE delivery_state='pending' AND delegation_id LIKE 'cron-owner-%'
+            AND origin_session IN (SELECT id FROM lineage)
+            AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
+            ORDER BY updated_at,delegation_id LIMIT 20""",
+            (str(getattr(session.get('agent'), 'session_id', '') or session.get('session_key') or ''),
+             time.time() - ledger._CLAIM_LEASE_S)).fetchall()
+    events = [json.loads(raw) for (raw,) in rows]
+    return [event for event in events if belongs_to_session(server, session, event)]
+
+
 def recover_interrupted(server, session, sid=None):
     """Bounded existing-poller recovery: report uncertain model starts, never rerun."""
     if session.get('running'):

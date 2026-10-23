@@ -853,9 +853,10 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
             last_bot_poll = now
             try:
                 _poll_bot_completion_notice_once(sid, session)
-                from cron.desktop_origin import recover_interrupted
+                from cron.desktop_origin import pending_for_session, recover_interrupted
                 from tui_gateway import server
                 recover_interrupted(server, session, sid)
+                handle(pending_for_session(server, session), None)
             except Exception:
                 logger.warning("Bot completion-notice poll failed", exc_info=True)
         # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock

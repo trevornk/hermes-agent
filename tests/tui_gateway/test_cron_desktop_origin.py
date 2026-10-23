@@ -295,3 +295,56 @@ def test_start_exception_after_commit_preserves_unknown_no_replay(owner, monkeyp
     assert record(event['delegation_id'])[0] == 'dropped'
     assert len(db._read_all("SELECT id FROM messages WHERE display_kind='cron_completion'")) == 1
     assert ledger.claim_event_delivery(event, 'restarted-owner') is None
+
+
+@pytest.mark.parametrize('secondary', [False, True])
+def test_actual_owner_poller_replays_when_shared_offer_is_consumed_elsewhere(owner, turn_env, monkeypatch, secondary):
+    """A foreign consumer repeatedly returns the only queue copy: owner must still progress."""
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from tools.process_registry import process_registry
+    from tools import process_registry_awaiting
+    session, db = owner
+    home = get_hermes_home()
+    token = None
+    if secondary:
+        home = home / 'profiles' / 'quant'
+        home.mkdir(parents=True)
+        token = set_hermes_home_override(str(home))
+        db = SessionDB(home / 'state.db')
+        db.create_session('owner', 'desktop', user_id='basic:alice')
+        @contextmanager
+        def database(_session):
+            yield db
+        monkeypatch.setattr(server, '_session_db', database)
+        monkeypatch.setattr(server, '_session_home', lambda _session: home)
+        session['profile_home'] = str(home)
+    try:
+        _job, event = publish(session)
+        # Model the real competing consumer, retaining no in-memory copy here.
+        while not process_registry.completion_queue.empty():
+            ledger.return_completion_offer(process_registry.completion_queue.get_nowait())
+        monkeypatch.setattr(process_registry, 'restore_completions', lambda: None)
+        monkeypatch.setattr(ledger, 'maybe_sweep_orphaned_completions', lambda _queue: 0)
+        monkeypatch.setattr(server, 'write_json', lambda frame: True)
+        monkeypatch.setattr(server, '_start_usage_ticker', lambda *args: (threading.Event(), SimpleNamespace(join=lambda: None)))
+        monkeypatch.setattr(server.threading, 'Thread', server._RealThread)
+        for name in ('_poll_bot_completion_notice_once', '_maybe_fire_tui_loop_tick', '_maybe_fire_tui_heartbeat_tick', '_notif_poll_kanban'):
+            monkeypatch.setattr(server, name, lambda *args: None)
+        seen = []
+        session['agent'].run_conversation = lambda text, **kwargs: seen.append(text) or {'final_response': 'owner followed through', 'messages': []}
+        stop = threading.Event()
+        monkeypatch.setattr(process_registry_awaiting, 'take_ready', lambda *args: stop.set() or [])
+        server._notification_poller_scoped_loop(stop, 'ui-owner', session)
+        thread = session.get('_run_thread')
+        assert thread is not None, 'durable pending receipt never reached owner admission'
+        thread.join(10)
+        assert not thread.is_alive()
+        assert record(event['delegation_id'])[0] == 'delivered'
+        assert len(seen) == 1
+        assert route.pending_for_session(server, session) == []
+        server._notif_dispatch_event('ui-owner', session, event, 'late shared copy')
+        assert len(seen) == 1
+    finally:
+        if token is not None:
+            db.close()
+            reset_hermes_home_override(token)
