@@ -301,6 +301,30 @@
     } catch (_e) { /* ignore quota / private mode */ }
   }
 
+  // Deep links: ``/kanban?task=<id>`` opens that card's drawer, and an
+  // optional ``&board=<slug>`` picks the board it lives on (task ids are
+  // per-board). The drawer's selection is mirrored back into ``?task=`` with
+  // replaceState so a reload or a copied URL lands on the same card, and
+  // closing the drawer drops the param. ``history.state`` is passed through
+  // untouched because the host router keys its own entries on it.
+  function readUrlParam(name) {
+    try {
+      const v = new URLSearchParams(window.location.search).get(name);
+      return (v || "").trim() || null;
+    } catch (_e) { return null; }
+  }
+
+  function writeTaskParam(taskId) {
+    try {
+      const url = new URL(window.location.href);
+      const current = (url.searchParams.get("task") || "").trim() || null;
+      if (current === (taskId || null)) return;
+      if (taskId) url.searchParams.set("task", taskId);
+      else url.searchParams.delete("task");
+      window.history.replaceState(window.history.state, "", url.pathname + url.search + url.hash);
+    } catch (_e) { /* URL sync is best-effort */ }
+  }
+
   function withBoard(url, board) {
     // Always append ?board=<slug> when we have one picked — including
     // "default". Omitting the param would fall through to the backend's
@@ -625,7 +649,7 @@
   function KanbanPage() {
     const { t } = useI18n();
     const kanbanDialogs = useKanbanDialogs(t);
-    const [board, setBoard] = useState(() => readSelectedBoard() || null);
+    const [board, setBoard] = useState(() => readUrlParam("board") || readSelectedBoard() || null);
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
     const [showBoardSettings, setShowBoardSettings] = useState(false);
@@ -650,7 +674,14 @@
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
 
-    const [selectedTaskId, setSelectedTaskId] = useState(null);
+    const [selectedTaskId, setSelectedTaskId] = useState(() => readUrlParam("task"));
+    // Keep ``?task=`` in step with the open drawer, and follow Back/Forward.
+    useEffect(function () { writeTaskParam(selectedTaskId); }, [selectedTaskId]);
+    useEffect(function () {
+      function onPopState() { setSelectedTaskId(readUrlParam("task")); }
+      window.addEventListener("popstate", onPopState);
+      return function () { window.removeEventListener("popstate", onPopState); };
+    }, []);
     const [selectedIds, setSelectedIds] = useState(() => new Set());
     const [lastSelectedId, setLastSelectedId] = useState(null);
     const [failedIds, setFailedIds] = useState(() => new Set());
