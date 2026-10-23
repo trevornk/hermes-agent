@@ -307,11 +307,30 @@ def _start_agent_build(sid: str, session: dict) -> None:
     build_thread.start()
 
 
-def _sess_nowait(params, rid):
-    sid = params.get("session_id") or ""
-    s = _sessions.get(sid)
-    if s:
-        return (s, None)
+# RPCs a client sends on its own, with no user action behind them: background polls of a cached runtime id, the
+# usage/ack follow-ups, and ``session.activate`` (the rebind attempt a view makes before it falls back to a cold
+# ``session.resume``). For these the 4001 below IS the designed notice — the client latches the id and resumes the
+# stored session — and nothing is lost by it. Anything else (prompt.submit, slash.exec, interrupt, ...) carries user
+# intent, so a rejection there stays a WARNING: it is the "message vanished" trace of #90428.
+_STALE_RUNTIME_POLL_METHODS = frozenset({
+    "approval.pending", "approval.received", "process.list", "session.control.read", "session.usage",
+    "session.activate"})
+
+
+def _log_stale_runtime_rejection(sid, rid) -> None:
+    method = _current_rpc_method.get() or "?"
+    # Dict lookups/assignments are atomic; the worst a race does is log one extra INFO for the same id.
+    closed = _recently_closed_runtimes.get(sid)
+    if closed is not None and method in _STALE_RUNTIME_POLL_METHODS:
+        # A runtime this process reclaimed (detached on WS disconnect and orphan-reaped, TTL, superseded) that a
+        # client — typically one that slept through the 5 min orphan grace and missed ``session.reclaimed`` —
+        # replayed. The rejection is the contract, not a fault: say so once per id, then stay quiet.
+        first, closed[1] = not closed[1], True
+        logger.log(
+            logging.INFO if first else logging.DEBUG,
+            "stale runtime id: method=%s session_id=%r was closed by this gateway %.0fs ago; answered 4001, the "
+            "client resumes the stored session, rid=%r", method, sid, time.monotonic() - closed[0], rid)
+        return
     # Stale runtime id (reaped/evicted/TTL): the client should session.resume the STORED id. Logged so
     # "message vanished" reads as "arrived and was rejected".
     logger.warning("session-scoped RPC rejected: method=%s session_id=%r not in memory "
@@ -322,7 +341,15 @@ def _sess_nowait(params, rid):
                    # class returned a silent 4001. Log it so a "message vanished" report is diagnosable as
                    # "request arrived and was rejected" instead of "request never arrived" (see #90428).
                    "(detached/reaped runtime; client should resume the stored session), rid=%r",
-                   _current_rpc_method.get() or "?", sid, rid)
+                   method, sid, rid)
+
+
+def _sess_nowait(params, rid):
+    sid = params.get("session_id") or ""
+    s = _sessions.get(sid)
+    if s:
+        return (s, None)
+    _log_stale_runtime_rejection(sid, rid)
     return (None, _err(rid, 4001, "session not found"))
 
 

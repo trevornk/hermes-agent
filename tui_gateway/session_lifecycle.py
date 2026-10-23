@@ -627,6 +627,13 @@ def _attach_worker(sid: str, session: dict, worker) -> None:
 # Wall-clock timestamps, like session last_active; retained after close/reap.
 _closed_session_activity: dict[str, float] = {}
 
+# Runtime ids THIS process closed itself (WS-orphan reap, idle TTL, session.close, supersede-by-resume), sid ->
+# [monotonic close time, already-reported]. Lets ``_sess_nowait`` tell "a client replayed the id of a runtime I
+# reclaimed" (expected: the 4001 is how a client that missed ``session.reclaimed`` learns to resume) from "an id I
+# never held". Bounded (insertion-ordered, oldest evicted); in-process only, so a gateway restart starts it empty.
+_RECENT_CLOSED_RUNTIME_CAP = 2048
+_recently_closed_runtimes: dict[str, list] = {}
+
 
 def _pop_session_by_id(sid: str) -> dict | None:
     """Atomically detach one live session from the registry — the ownership claim for teardown (a concurrent
@@ -641,6 +648,10 @@ def _pop_session_by_id(sid: str) -> dict | None:
             _closed_session_activity[home] = max(_closed_session_activity.get(home, 0), last_active)
             session["_closing"] = True
             session["_sid"] = sid  # out of _sessions now, so teardown can't recover the live id by scanning
+            _recently_closed_runtimes.pop(sid, None)  # re-insert at the young end
+            _recently_closed_runtimes[sid] = [time.monotonic(), False]
+            while len(_recently_closed_runtimes) > _RECENT_CLOSED_RUNTIME_CAP:
+                del _recently_closed_runtimes[next(iter(_recently_closed_runtimes))]
     return session
 
 
