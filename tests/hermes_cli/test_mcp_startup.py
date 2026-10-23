@@ -477,3 +477,64 @@ def test_server_added_after_discovery_is_connected_by_the_next_agent_build(monke
     configured["linear"] = {"url": "https://mcp.example.test/linear"}  # hermes mcp add linear
     build_agent()
     assert len(runs) == 2
+
+
+def _discovery_probe(monkeypatch, *, connected: bool = False):
+    """Stub the config probe + discovery so a test drives ``start_background_mcp_discovery``
+    with a mutable ``state["configured"]`` and records each run and each warning."""
+    state = {"configured": False, "runs": 0}
+    warnings: list[str] = []
+    monkeypatch.setattr(mcp_startup, "_has_configured_mcp_servers", lambda: state["configured"])
+    monkeypatch.setattr(mcp_startup, "_any_mcp_connected", lambda: connected)
+    monkeypatch.setattr(mcp_startup, "_servers_awaiting_connect", list)
+    monkeypatch.setattr(
+        mcp_startup,
+        "_discover_mcp_tools_without_interactive_oauth",
+        lambda: state.__setitem__("runs", state["runs"] + 1),
+    )
+    logger = types.SimpleNamespace(
+        debug=lambda *_a, **_k: None,
+        info=lambda *_a, **_k: None,
+        warning=lambda msg, *a, **_k: warnings.append(msg % a if a else msg),
+    )
+
+    def build_agent():
+        mcp_startup.start_background_mcp_discovery(logger=logger, thread_name="t")
+        thread = mcp_startup._current_home_thread()
+        if thread is not None:
+            thread.join(timeout=5.0)
+
+    return state, warnings, build_agent
+
+
+def test_no_configured_servers_does_not_warn_about_failed_discovery(monkeypatch):
+    """A profile with ZERO ``mcp_servers`` never spawns a discovery thread, so there is no earlier
+    run that "exited with no connected servers". Every later agent build used to see the
+    first call's ``started`` mark + no thread + nothing connected and log that warning (and
+    retry) on every build. It must stay quiet, never run discovery, and still connect a server
+    added afterwards on the next build (#76954)."""
+    state, warnings, build_agent = _discovery_probe(monkeypatch)
+
+    for _ in range(3):  # backend start + two new sessions, nothing configured
+        build_agent()
+    assert state["runs"] == 0
+    assert not any("previously exited" in w for w in warnings), warnings
+
+    state["configured"] = True  # ``hermes mcp add`` against the running backend
+    build_agent()
+    assert state["runs"] == 1
+    assert not any("previously exited" in w for w in warnings), warnings
+
+
+def test_configured_servers_with_none_connected_still_warns_and_retries(monkeypatch):
+    """Control for the no-servers quiet path: when servers ARE configured and the prior run left
+    none connected, the re-entry still warns and retries (#66981)."""
+    state, warnings, build_agent = _discovery_probe(monkeypatch)
+    state["configured"] = True
+
+    build_agent()  # first run connects nothing
+    assert state["runs"] == 1
+    assert not any("previously exited" in w for w in warnings), warnings
+    build_agent()  # re-entry after it finished
+    assert state["runs"] == 2
+    assert sum("previously exited" in w for w in warnings) == 1, warnings

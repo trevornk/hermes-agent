@@ -122,9 +122,12 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
             _mcp_discovery_started.discard(home_key)
             _mcp_discovery_thread.pop(home_key, None)
 
-        _mcp_discovery_started.add(home_key)
+        # Nothing configured: no discovery runs, so record nothing. Marking the home "started" here
+        # made every later call look like a run that exited with no connected servers (spurious
+        # warning + retry per agent build); left unmarked, a server added later starts a fresh run.
         if not _has_configured_mcp_servers():
             return
+        _mcp_discovery_started.add(home_key)
 
         # Bare threads start from an empty context: run discovery under a copy of the caller's, so
         # the context-local HERMES_HOME override (multi-profile dashboard/desktop backends, #67605)
