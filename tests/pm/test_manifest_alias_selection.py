@@ -102,6 +102,9 @@ def test_manifestless_package_and_staged_destination_survive(roots):
     p.mkdir(parents=True)
     (p / 'pyproject.toml').write_text('[project]\nname="legacy"\nversion="1.0"\n')
     config(home, ['legacy'])
+    # v0.22.5 excludes metadata-only plugins; a real dependency still joins.
+    assert ws.enabled_member_dirs() == []
+    (p / 'pyproject.toml').write_text('[project]\nname="legacy"\nversion="1.0"\ndependencies=["httpx==0.28.1"]\n')
     assert ws.enabled_member_dirs() == [p]
     staging = home / 'plugins/incoming'
     assert ws.enabled_plugin_dirs(proposed_home=home, enabled=['incoming'], installing=staging) == [staging]
