@@ -1430,6 +1430,111 @@ class TestTodoSnapshotScaffoldingTails:
             for previous, current in itertools.pairwise(compressed)
         )
 
+    def test_buried_standalone_snapshot_is_replaced_not_duplicated(
+        self, tmp_path: Path
+    ):
+        """A tool result after a snapshot must not make the next boundary stack it."""
+        from tools.todo_tool import TODO_INJECTION_HEADER
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        agent = self._agent_with_todo(
+            db,
+            "PARENT_TODO_BURIED",
+            {"role": "tool", "tool_call_id": "call-1", "content": "done"},
+        )
+        agent.context_compressor.compress.return_value.insert(
+            -1,
+            {
+                "role": "user",
+                "content": (
+                    f"{TODO_INJECTION_HEADER}\n"
+                    "- [ ] t0. stale task (pending)"
+                ),
+                "_todo_snapshot_synthetic": True,
+            },
+        )
+
+        compressed, _ = agent._compress_context(
+            _msgs(), "sys", approx_tokens=120_000
+        )
+
+        snapshot_rows = [
+            message
+            for message in compressed
+            if TODO_INJECTION_HEADER in str(message.get("content") or "")
+        ]
+        assert len(snapshot_rows) == 1
+        assert "task A" in str(snapshot_rows[0]["content"])
+        assert "stale task" not in str(snapshot_rows[0]["content"])
+
+    def test_every_stale_snapshot_is_stripped_not_only_the_newest(
+        self, tmp_path: Path
+    ):
+        """A refresh must clear EVERY earlier block: a merged one buried behind
+        tool rows and a resumed standalone row that lost its synthetic flag."""
+        from tools.todo_tool import TODO_INJECTION_HEADER
+
+        def _call(call_id: str) -> dict:
+            return {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        agent = self._agent_with_todo(
+            db,
+            "PARENT_TODO_STACKED",
+            {"role": "tool", "tool_call_id": "call-2", "content": "done"},
+        )
+        agent.context_compressor.compress.return_value[2:2] = [
+            {
+                "role": "user",
+                "content": (
+                    "please fix the login bug\n\n"
+                    f"{TODO_INJECTION_HEADER}\n- [ ] t0. stale merged task (pending)"
+                ),
+            },
+            {"role": "assistant", "content": "on it", "tool_calls": [_call("call-1")]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+            # Loaded back from the DB: the synthetic flag is not persisted.
+            {
+                "role": "user",
+                "content": (
+                    f"{TODO_INJECTION_HEADER}\n"
+                    "- [ ] t0. stale standalone task (pending)"
+                ),
+            },
+            {"role": "assistant", "content": "continuing", "tool_calls": [_call("call-2")]},
+        ]
+        # Bulky input keeps the commit-site anti-growth guard (whose salvage
+        # pass drops the snapshot) out of the picture.
+        original = [
+            {"role": "user", "content": f"m{i} " + "lorem ipsum " * 80}
+            for i in range(20)
+        ]
+
+        compressed, _ = agent._compress_context(
+            original, "sys", approx_tokens=120_000
+        )
+
+        snapshot_rows = [
+            message
+            for message in compressed
+            if TODO_INJECTION_HEADER in str(message.get("content") or "")
+        ]
+        assert len(snapshot_rows) == 1
+        assert "task A" in str(snapshot_rows[0]["content"])
+        combined = "\n".join(str(m.get("content") or "") for m in compressed)
+        assert "stale merged task" not in combined
+        assert "stale standalone task" not in combined
+        assert "please fix the login bug" in combined
+        assert all(
+            str(message.get("content") or "").strip()
+            for message in compressed
+            if message.get("role") == "user"
+        ), "stripping a scaffolding-only row must not leave an empty user turn"
+
     def test_empty_todo_store_injects_nothing(self, tmp_path: Path):
         from tools.todo_tool import TODO_INJECTION_HEADER
 
