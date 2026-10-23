@@ -752,7 +752,10 @@ class PluginContext:
             return
         launch_scope = hermes_home_key(get_process_hermes_home())
         if self._manager.scope_key != launch_scope:
-            logger.warning(
+            # Expected, not actionable: any process that inspects a sibling profile (e.g. ``--profile X
+            # gateway status`` reading another home's config) builds a manager for that home and loads the
+            # bundled auth plugin into it. The refusal is the security boundary working, so don't warn each time.
+            logger.debug(
                 "Plugin '%s' tried to register dashboard-auth provider %r "
                 "from profile scope %s; ignoring it because dashboard auth "
                 "is owned by launch scope %s.",
