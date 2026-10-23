@@ -111,6 +111,10 @@ def recover_publication(project: Path) -> None:
                 raise ValueError("config path is outside Hermes state")
             previous = base64.b64decode(entry["previous"], validate=True) if entry["previous"] is not None else None
             configs.append((config, previous, entry.get("config_after")))
+        # Lazy: this module is part of the launcher's bootstrap closure (hermes_bootstrap →
+        # pm.environments.activate_dependencies → here), which must stay importable without the
+        # rest of pm/ (tests/hermes_cli/test_doctor_command_install.py pins that closure).
+        from pm.outer_transaction import unlink as _publication_unlink
         if not row.get("committed") and _digest(runtime_facts_path(project)) == row["facts_before"]:
             for config, previous, after in configs:
                 prior = hashlib.sha256(previous).hexdigest() if previous is not None else None
@@ -119,10 +123,10 @@ def recover_publication(project: Path) -> None:
             # No selection was published. Roll back before any plugin is loaded.
             for config, previous, _after in configs:
                 if previous is None:
-                    config.unlink(missing_ok=True)
+                    _publication_unlink(config)
                 else:
                     _atomic_bytes(config, previous)
-        journal.unlink()
+        _publication_unlink(journal)
     except (ValueError, KeyError, TypeError, OSError) as exc:
         raise RuntimeError(f"cannot recover dependency publication: {journal}: {exc}") from exc
 

@@ -387,6 +387,8 @@ def _install_plugin_core(
     and may raise :class:`PluginOperationError` to abort (re-pin consent). *accept_caution* decides a
     caution scan verdict on its own when *force* only means "replace the existing tree" (an update's
     re-clone); None lets *force* decide both, as ``install --force`` does."""
+    from pm.outer_transaction import refuse_plugin_swap
+    refuse_plugin_swap()
     requested_revision = _pc()._normalize_exact_revision(ref) if ref is not None else None
     try:
         git_url, subdir = _pc()._resolve_git_url(identifier)

@@ -115,7 +115,9 @@ def durable_write_bytes(path: Path, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        from pm.outer_transaction import publication
+        with publication(path, Path(temporary)):
+            os.replace(temporary, path)
         if os.name != "nt":
             directory = os.open(path.parent, os.O_RDONLY)
             try:

@@ -175,18 +175,46 @@ def enabled_plugin_entries(*, proposed_home=None, enabled=None, disabled=None,
         skip_invalid_secondary=skip_invalid_secondary,
     )
     entries = []
+    if not selection:
+        return entries
+    from hermes_cli.plugins_manifest import manifest_key
+    from pm.manifest_selection import BUNDLED_PROVIDER_DIRS, directory_manifests, winning_manifests
+    from pm.plugins_state import read_home_selection
+
+    bundled_root = paths.repo_root() / "plugins"
+    bundled = directory_manifests(bundled_root, "bundled")
     for plugins_dir, names in selection.items():
+        home = plugins_dir.parent
+        config = read_home_selection(home) or {}
+        denied = set((config.get("plugins") or {}).get("disabled") or ())
+        if proposed_home is not None and home.resolve() == Path(proposed_home).resolve():
+            denied = set(disabled or ())
+        manifests = winning_manifests(bundled, plugins_dir)
         for name in names:
             relative = Path(name)
             if relative.is_absolute() or ".." in relative.parts:
                 raise InstallError("venv", f"invalid plugin key: {name}")
+            matches = [m for m in manifests if name in {manifest_key(m), m.name}]
+            if matches:
+                entries.extend((plugins_dir, name, Path(m.path)) for m in matches
+                               if not {manifest_key(m), m.name} & denied)
+                continue
+            # Preserve package-only and category-owned provider declarations,
+            # and admission's not-yet-published destination. A manifest-bearing
+            # directory is NOT an alias unless discovery actually accepts it.
             plugin_dir = plugins_dir / relative
             proposed = installing is not None and plugin_dir.resolve() == installing.resolve()
             if not proposed and not _is_directory(plugin_dir):
-                plugin_dir = paths.repo_root() / "plugins" / relative
-            if proposed or _is_directory(plugin_dir):
+                plugin_dir = bundled_root / relative
+            if proposed:
                 entries.append((plugins_dir, name, plugin_dir))
-    return entries
+            elif _is_directory(plugin_dir):
+                read_python_declaration(plugin_dir)  # validates; a malformed declaration fails enumeration closed
+                has_manifest = any((plugin_dir / f).exists() for f in ("plugin.yaml", "plugin.yml", "plugin.json"))
+                provider = plugin_dir.is_relative_to(bundled_root) and relative.parts[0] in BUNDLED_PROVIDER_DIRS
+                if (not has_manifest or provider) and name not in denied:
+                    entries.append((plugins_dir, name, plugin_dir))
+    return list(dict.fromkeys(entries))
 
 
 def enabled_plugin_dirs(*, proposed_home=None, enabled=None, disabled=None,

@@ -177,6 +177,12 @@ def _copy_fallback(tmp_str: str, real_path: str) -> None:
 
 
 def atomic_replace(tmp_path: str | Path, target: str | Path) -> str:
+    from pm.outer_transaction import publication
+    with publication(Path(target), Path(tmp_path)):
+        return _atomic_replace_planned(tmp_path, target)
+
+
+def _atomic_replace_planned(tmp_path: str | Path, target: str | Path) -> str:
     """Atomically move *tmp_path* onto *target*, preserving symlinks.
 
     Resolves a symlink first so ``os.replace`` writes the real file in place and the symlink
@@ -192,6 +198,9 @@ def atomic_replace(tmp_path: str | Path, target: str | Path) -> str:
         os.replace(tmp_str, real_path)
         return real_path
     except OSError as exc:
+        from pm.outer_transaction import active
+        if active():
+            raise  # A partial in-place fallback cannot satisfy an exact write-ahead intent.
         contended = _is_contended_windows_replace_error(exc)
         if exc.errno not in _CROSS_DEVICE_ERRNOS and not contended:
             raise

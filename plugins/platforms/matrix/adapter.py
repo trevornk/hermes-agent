@@ -2485,12 +2485,16 @@ class MatrixAdapter(BasePlatformAdapter):
                     inviter,
                 )
                 continue
+            if is_direct and not inviter:
+                logger.warning(
+                    "Matrix: joining direct invite to %s without recording it in m.direct "
+                    "because the invite state has no inviter", room_id)
             logger.info(
                 "Matrix: reconciling pending invite for %s (is_direct=%s)",
                 room_id,
                 is_direct,
             )
-            self._schedule_invite_join(str(room_id), is_direct=is_direct, inviter=inviter)
+            self._schedule_invite_join(str(room_id), is_direct=is_direct and bool(inviter), inviter=inviter)
 
     def _extract_invite_dm_signal(self, invited_room: Any) -> tuple[bool, str]:
         """Read the is_direct flag and inviter from a room's invite_state.
@@ -2518,7 +2522,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 continue
             if event.get("type") != "m.room.member":
                 continue
-            if event.get("state_key") != self._user_id:
+            if not self._is_self_sender(str(event.get("state_key", "") or "")):
                 continue
 
             content = event.get("content", {})
@@ -2527,7 +2531,7 @@ class MatrixAdapter(BasePlatformAdapter):
             if content.get("membership") != "invite":
                 continue
 
-            return bool(content.get("is_direct")), str(event.get("sender", ""))
+            return bool(content.get("is_direct")), str(event.get("sender", "") or "")
 
         return False, ""
 

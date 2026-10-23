@@ -384,6 +384,11 @@ class TestReconnectDropsEmptyToken:
                 drop_reasons.append(reason)
                 raise _StopAtCredentialGate()
 
+            async def _run_in_executor_with_context(self, function, *args):
+                # Upstream now resolves the platform plugin before _create_adapter.
+                # This test stops at the credential gate, before either operation.
+                raise _StopAtCredentialGate()
+
             def _create_adapter(self, *a, **k):
                 # Reached only when the credential gate passed. BaseException (not
                 # Exception) so it isn't swallowed by the method's `except Exception`.

@@ -136,6 +136,9 @@ def collect_superseded_generations(project_root: Path) -> None:
     """
     import logging
 
+    from pm.outer_transaction import active
+    if active():
+        return  # The outer rollback still owns the old selections/generations.
     from hermes_cli.runtime_state import collect_generations
     from pm.environments import install_state_dir
     from pm.runtime import collect_runtime_generations

@@ -74,7 +74,7 @@ def _enabled_from_config(config: dict[str, Any]) -> list[str]:
     out: list[str] = []
     for name in enabled:
         if (isinstance(name, str) and name and name not in out
-                and name not in disabled and name.rsplit("/", 1)[-1] not in disabled):
+                and name not in disabled):
             out.append(name)
     return out
 
