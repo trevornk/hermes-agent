@@ -421,12 +421,29 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
     media_files = media_files or []
     metadata = {"thread_id": thread_id} if thread_id else None
     from gateway.config import Platform
-    _, live_adapter = _live_adapter(Platform.MATRIX, lookup_failed_warning=(
+    runner, live_adapter = _live_adapter(Platform.MATRIX, lookup_failed_warning=(
         "Matrix: live gateway adapter lookup failed; falling back to an "
         "ephemeral connect (may re-init E2EE per send)"))
     if live_adapter is not None:
-        # Owned by the gateway — must NOT be disconnected (return before the ephemeral ``finally``).
-        return await _matrix_send_core(live_adapter, chat_id, message, media_files, metadata)
+        # The live adapter's aiohttp session (and asyncio.wait_for/timeout context) is bound
+        # to the gateway's own event loop (runner._gateway_loop). cron's standalone-delivery
+        # fallback (cron/scheduler.py) runs this coroutine inside a *fresh* loop via
+        # asyncio.run() whenever the primary live-adapter delivery attempt itself failed or
+        # timed out — reusing the gateway-loop-bound adapter from that fresh loop raises
+        # "Timeout context manager should be used inside a task" because asyncio's timeout
+        # machinery is loop-affine (observed in production 2026-08-02, alerts-infra room, two
+        # cron jobs after a transient DNS failure hit the primary attempt first). Only take
+        # the fast path when actually executing on the gateway's own loop; otherwise fall
+        # through to the ephemeral adapter below, which is safe from any thread/loop.
+        gateway_loop = getattr(runner, "_gateway_loop", None)
+        current_loop = asyncio.get_running_loop()
+        if gateway_loop is None or current_loop is gateway_loop:
+            # Owned by the gateway — must NOT be disconnected (return before the ephemeral ``finally``).
+            return await _matrix_send_core(live_adapter, chat_id, message, media_files, metadata)
+        logger.debug(
+            "Matrix: live gateway adapter found but current loop != gateway loop; "
+            "using ephemeral adapter to avoid a cross-loop timeout-context error"
+        )
     try:
         from plugins.platforms.matrix.adapter import MatrixAdapter
     except ImportError:
