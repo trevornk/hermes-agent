@@ -791,6 +791,18 @@ def ensure_matrix_deps() -> bool:
     return True
 
 
+def _is_invited_room_source(source: Any) -> bool:
+    """True when *source* (the mautrix ``SyncStream`` flag ``Client.dispatch_event`` stamps on an
+    event) says it came from the ``rooms.invite`` section. Anything unclassifiable answers True so
+    an unusual caller keeps the old act-on-it behaviour rather than silently dropping an invite."""
+    try:
+        from mautrix.client import SyncStream
+
+        return bool(source & SyncStream.INVITED_ROOM)
+    except Exception:
+        return True
+
+
 class MatrixAdapter(BasePlatformAdapter):
     """Gateway adapter for Matrix (any homeserver)."""
     serial_receive_loop = True  # _sync_loop reads the next sync only after this sync's handlers return
@@ -2315,8 +2327,23 @@ class MatrixAdapter(BasePlatformAdapter):
         return await cache_document_from_bytes_async(file_bytes, filename)
 
     async def _on_invite(self, event: Any) -> None:
-        """Auto-join rooms when invited, recording DM rooms in m.direct."""
+        """Auto-join rooms when invited, recording DM rooms in m.direct.
+
+        mautrix's ``MembershipEventDispatcher`` fans out every ``m.room.member`` event whose
+        membership is ``invite`` as ``InternalEventType.INVITE`` -- including historic ones
+        re-read from a joined room's state/timeline on each (re)connect (we sync with
+        ``MemorySyncStore``, so every connect is a full initial sync and each joined room's
+        recent timeline is dispatched again). The only invite we can act on is the one the
+        homeserver delivers in ``rooms.invite``; everything else is history and stays quiet.
+        """
         room_id = str(getattr(event, "room_id", ""))
+        source = getattr(event, "source", None)
+        if source is not None and not _is_invited_room_source(source):
+            logger.debug("Matrix: ignoring replayed membership invite in %s (source=%s)", room_id, source)
+            return
+        if room_id and room_id in self._joined_rooms:
+            logger.debug("Matrix: ignoring invite to %s — already joined", room_id)
+            return
         is_direct = bool(getattr(getattr(event, "content", None), "is_direct", False))
         inviter = str(getattr(event, "sender", ""))
         # [carried, matrix_invite_target_guard.patch] mautrix's
