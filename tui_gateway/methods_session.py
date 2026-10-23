@@ -628,9 +628,25 @@ class _Resume:
         # inline_images=False renders image parts as "[image]" (#116511); default keeps data URIs.
         self.inline_images = "inline_images" not in params or _flag(params, "inline_images")
 
+    def source(self) -> str:
+        """Surface the resumed live record answers on: the client's ``source`` param, else the stored row's
+        ``desktop`` tag, else the process-env default.
+
+        A Desktop client that omits ``source`` on a resume (tile/pane resume, a reconnect after a backend
+        restart) is served by a backend where ``HERMES_DESKTOP`` is unset (remote dashboard/cloud), so the
+        env fallback labeled a desktop chat ``tui`` and the agent was told MEDIA: tags are not delivered.
+        The row remembers the surface the chat was created on. Stdio is the terminal UI's own transport
+        (``hermes --tui`` never sends ``source``), so a TUI resuming a desktop chat keeps its own surface."""
+        if explicit := _str_param(self.params, "source"):
+            return explicit
+        stored = str((self.found or {}).get("source") or "").strip().lower()
+        if stored == "desktop" and (current_transport() or _stdio_transport) is not _stdio_transport:
+            return stored
+        return _resolve_session_source(None)
+
     def mint(self, prompts: bool = True) -> tuple:
         """``(runtime sid, source, cwd)`` for the live record this resume registers (+ gateway prompts on)."""
-        ids = _new_runtime_ids(self.params)
+        ids = (uuid.uuid4().hex[:8], self.source())
         if prompts:
             _enable_gateway_prompts()
         return *ids, self.profile_resume_cwd or _default_session_cwd()
