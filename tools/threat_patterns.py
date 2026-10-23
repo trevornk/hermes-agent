@@ -18,7 +18,15 @@ MAX_SCAN_CHARS = 65_536
 # Bounded filler between key attack words (unbounded ``(?:\w+\s+)*`` backtracks badly).
 _FILLER = r"(?:\w+\s+){0,8}"
 # Env var reference ending in a secret-ish suffix (see exfil comment below).
-_SECRET_VAR = r"\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)S?\b"
+# The braced form ``${TOKEN}`` is closed explicitly (``\}``) rather than via
+# an optional-then-\b tail: an optional-close (``\}?\b``) leaves the closing
+# ``}`` unconsumed when the reference IS braced, so a quoted auth-header
+# value like ``"Authorization: Bearer ${TOKEN}"`` has that stray ``}``
+# sitting between the match and the closing quote — defeating the
+# exfil_curl/exfil_wget `(?!["'])` auth-header exemption below for every
+# braced reference (see #55187 replay note; caught by
+# test_auth_header_with_braced_var_is_not_exfiltration).
+_SECRET_VAR = r"\$(?:\{\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)S?\}|\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)S?\b)"
 # Verb prefix for "modify agent config" patterns.
 _MODIFY = r"(update|modify|edit|write|change|append|add\s+to)\s+[^\n]{0,2048}"
 # (regex, pattern_id, scope); scope ∈ {"all", "context", "strict"}
