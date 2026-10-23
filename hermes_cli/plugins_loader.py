@@ -16,6 +16,7 @@ import logging
 import re
 import sys
 import threading
+import time
 import types
 from contextlib import contextmanager
 from functools import wraps
@@ -49,6 +50,12 @@ _ABANDONED_LOADERS: list[threading.Thread] = []
 _ABANDONED_LOADERS_LOCK = threading.Lock()
 # Guards creating a manager's plugin host, so concurrent first callers share one host process.
 _PLUGIN_HOST_CREATE_LOCK = threading.Lock()
+# Retry schedule for a context-engine plugin whose load failed (rearm_failed_context_engine): the first
+# engine lookup after the failure retries at once (a startup overrun has normally cleared by the first agent
+# build), then each further failure doubles the wait from the base up to the cap, so a permanently broken
+# plugin costs one deadline-bounded import per window instead of one per agent build.
+_CONTEXT_ENGINE_REARM_BASE_SECS = 30.0
+_CONTEXT_ENGINE_REARM_MAX_SECS = 600.0
 # PluginContexts of the outermost deadline-bounded load; set only inside its worker.
 _IN_PLUGIN_LOAD: contextvars.ContextVar[Optional[list[PluginContext]]] = contextvars.ContextVar(
     "hermes_plugin_load_scope", default=None,
@@ -219,7 +226,8 @@ class PluginLoaderMixin:
         just the newcomer after a mid-run ``hermes plugins install/enable``, Desktop / dashboard /
         ``plugins.manage`` install-enable-update, a tool-triggered force re-discovery or the gateway's
         ``reload-plugins`` verb (all of which run ``discover_plugins(force=True)``; a non-forced call
-        short-circuits on ``_discovered`` and never fires). See
+        short-circuits on ``_discovered`` and never fires), and after :meth:`rearm_failed_context_engine`
+        brings back a plugin whose startup load had failed. See
         :func:`hermes_cli.plugins_activation.plugin_activation_summary` for the payload: ``activated_now``
         (gateway commands/transforms/hooks/callbacks, live at once) vs ``deferred`` (``tools``/``prompt``
         until the next session, ``mcp_servers`` — the plugin's mcp.json server names — until ``mcp.reload``).
@@ -300,6 +308,82 @@ class PluginLoaderMixin:
             logger.info("Re-arming failed platform plugin load: %s", platform_name)
             self._register_deferred_platform(failed)
             return True
+
+    @staticmethod
+    def _declares_context_engine(manifest: PluginManifest) -> bool:
+        """Whether the plugin's entry module calls ``register_context_engine``. The manifest has no field for
+        it, so a source marker decides, as ``plugins_manifest._detect_kind_from_source`` does for kinds."""
+        from hermes_cli.plugins_manifest import _read_source_from_origin, resolve_module_origin
+        if manifest.source == "entrypoint":
+            origin = resolve_module_origin(str(manifest.path or "").partition(":")[0].strip())
+        else:
+            origin = str(Path(manifest.path) / "__init__.py") if manifest.path else None
+        return "register_context_engine" in _read_source_from_origin(origin, limit=1 << 20)
+
+    def _context_engine_candidate(self, plugin_key: str, manifest: PluginManifest) -> bool:
+        """Memoized :meth:`_declares_context_engine`: an unrelated failed plugin is read once per process,
+        not on every engine lookup while no engine is registered."""
+        declared = self._context_engine_declared.get(plugin_key)
+        if declared is None:
+            declared = self._context_engine_declared[plugin_key] = self._declares_context_engine(manifest)
+        return declared
+
+    def context_engine_after_rearm(self):
+        """The registered context engine, after re-arming a failed context-engine plugin load when there is
+        none (:meth:`rearm_failed_context_engine`), so the lookup that needs the engine is what heals it."""
+        if self._context_engine is None:
+            self.rearm_failed_context_engine()
+        return self._context_engine
+
+    def rearm_failed_context_engine(self) -> bool:
+        """Retry the load of a context-engine plugin whose import + register() raised or overran its deadline.
+        A failed load disposes its registrations, so after a transient startup failure (I/O contention during
+        a restart storm) ``_context_engine`` stays ``None`` for the life of the process and every agent built
+        in it silently runs the built-in compressor; the context-engine twin of the platform re-arm (#126356).
+        One deadline-bounded load per call under the manager's own discovery lock; a plugin that keeps failing
+        is retried on a doubling backoff (``_CONTEXT_ENGINE_REARM_*``). True when a retry registered an engine."""
+        if not self._discovered or in_plugin_load_worker():
+            return False  # discovery owns the first load; a load worker must never wait on its own sweep's lock
+        with self._discovery_lock, _plugin_home_scope(self.home_path):
+            if self._context_engine is not None:
+                return False
+            loaded_before = frozenset(k for k, p in self._plugins.items() if not p.error and not p.deferred)
+            healed = self._retry_failed_context_engine_loads()
+        # Outside the lock, as discover_and_load does: the gateway re-wires the plugin's handlers from it.
+        self._notify_plugin_loaded(loaded_before)
+        return healed
+
+    def _retry_failed_context_engine_loads(self) -> bool:
+        """The :meth:`rearm_failed_context_engine` pass, under the discovery lock and home scope."""
+        from hermes_cli.plugins_discovery import _get_disabled_plugins, _get_enabled_plugins, gate_manifest
+        from hermes_cli.plugins_manifest import requires_hermes_error
+        failed = {k: p.manifest for k, p in self._plugins.items() if p.error and not p.enabled and not p.deferred}
+        if not failed:
+            return False
+        disabled, enabled = _get_disabled_plugins(), _get_enabled_plugins()
+        now = time.monotonic()
+        for plugin_key, manifest in failed.items():
+            attempts, not_before = self._context_engine_rearm.get(plugin_key, (0, 0.0))
+            # Re-gate before reading any source: a placeholder (disabled, not enabled, catalog-removed) or a
+            # requires_hermes mismatch carries the same error-set shape as a failed load but must never be
+            # imported; then only a plugin that registers a context engine is a candidate.
+            if (now < not_before or requires_hermes_error(manifest)
+                    or gate_manifest(manifest, disabled, enabled).action not in ("load", "load_now")
+                    or not self._context_engine_candidate(plugin_key, manifest)):
+                continue
+            with _ABANDONED_LOADERS_LOCK:  # its hung import is still running: another retry only leaks a thread
+                if any(t.is_alive() and t.name == f"{_LOADER_THREAD_PREFIX}{plugin_key}" for t in _ABANDONED_LOADERS):
+                    continue
+            wait = min(_CONTEXT_ENGINE_REARM_BASE_SECS * 2 ** attempts, _CONTEXT_ENGINE_REARM_MAX_SECS)
+            self._context_engine_rearm[plugin_key] = (attempts + 1, now + wait)
+            logger.info("Re-arming failed context-engine plugin load: %s (retry %d; last failure: %s)",
+                        plugin_key, attempts + 1, self._plugins[plugin_key].error)
+            self._load_plugin_scoped(manifest)
+            if self._plugins[plugin_key].enabled:
+                self._context_engine_rearm.pop(plugin_key, None)
+            if self._context_engine is not None:
+                return True
+        return False
 
     @_serialized_replacement
     def _lease_deferred_platform(self, manifest: PluginManifest, lookup_key: str) -> bool:

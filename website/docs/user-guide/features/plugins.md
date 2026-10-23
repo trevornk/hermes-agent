@@ -198,7 +198,9 @@ plugins:
   # Ns" (reported like any other load failure: the startup warning and the
   # in-session `/plugins` listing) and the remaining plugins keep loading; the
   # stuck thread is abandoned. Default 10; set 0 to disable; values above 600
-  # are clamped.
+  # are clamped. A failed load is retried without a restart where something
+  # needs the plugin: a platform by the gateway's reconnect watcher, a context
+  # engine by the next agent build (on a backoff from 30s up to 10 minutes).
   load_timeout_seconds: 10
 ```
 
