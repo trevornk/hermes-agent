@@ -73,6 +73,10 @@ async def resolve_image_source(
     candidate = s[len("file://"):] if s.lower().startswith("file://") else s
     p = Path(os.path.expanduser(candidate))
     host_target = _permitted_host_read_target(p, ctx)
+    if host_target is not None and not host_target.is_file():
+        # A retyped macOS screenshot name loses its U+202F (renders as a space): use the one
+        # on-disk name that is unicode-equivalent, same rule as read_file.
+        host_target = _unicode_variant_target(host_target, ctx) or host_target
     if host_target is not None and host_target.is_file():
         _guard_credential_read(host_target, s)
         data = await asyncio.to_thread(host_target.read_bytes)
@@ -183,6 +187,15 @@ def _permitted_host_read_target(p: Path, ctx: ResolveContext) -> Optional[Path]:
     if any(real.is_relative_to(root.resolve()) for root in _media_cache_roots()):
         return real
     return None
+
+
+def _unicode_variant_target(target: Path, ctx: ResolveContext) -> Optional[Path]:
+    from tools.file_operations_common import unicode_variant_entry
+    try:
+        hit = unicode_variant_entry(target.name, os.listdir(target.parent))
+    except OSError:
+        return None
+    return None if hit is None else _permitted_host_read_target(target.parent / hit, ctx)
 
 
 def _get_active_env(task_id: Optional[str]):

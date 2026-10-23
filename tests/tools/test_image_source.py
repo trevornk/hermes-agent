@@ -99,6 +99,26 @@ class TestLocalBackend:
         assert res.data == PNG
         assert res.origin == "file"
 
+    @pytest.mark.asyncio
+    async def test_retyped_screenshot_name_resolves_to_u202f_spelling(self, tmp_path, monkeypatch):
+        """macOS names screenshots '... 11.37.03\u202fAM.png'; a model retyping the path emits an
+        ASCII space. The one unicode-equivalent on-disk name must be read, as read_file does."""
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        (tmp_path / "Screenshot at 11.37.03\u202fAM.png").write_bytes(PNG)
+        res = await isrc.resolve_image_source(
+            str(tmp_path / "Screenshot at 11.37.03 AM.png"), isrc.ResolveContext())
+        assert res.data == PNG
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_unicode_variants_stay_not_found(self, tmp_path, monkeypatch):
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        for sep in ("\u202f", "\u00a0"):
+            (tmp_path / f"shot{sep}AM.png").write_bytes(PNG)
+        with pytest.raises(isrc.SourceNotFound):
+            await isrc.resolve_image_source(str(tmp_path / "shot AM.png"), isrc.ResolveContext())
+
 
 class TestNonLocalBackendConfinement:
     """The security model: under a sandbox backend, host reads are confined to
