@@ -35,6 +35,21 @@ def session_source_for(platform: Optional[str]) -> str:
     return source or platform or "cli"
 
 
+def creatable_session_source(platform: Optional[str], creatable) -> str:
+    """``session_source_for`` at the gateway's ``session.create`` boundary, which only takes the
+    surfaces it advertises (*creatable*). An INHERITED label it refuses -- ``kanban``/``cron`` exported
+    by a worker shell to a nested ``hermes chat -q`` -- belongs to the parent, not this process: drop
+    it and label the run as this process's own surface instead of failing the create with
+    ``invalid_params``. An explicit ``--source`` is returned unchanged; its refusal names the flag."""
+    source = session_source_for(platform)
+    if source in creatable or get_session_env("HERMES_SESSION_SOURCE_EXPLICIT", "") == "1":
+        return source
+    single_query = get_session_env("HERMES_SINGLE_QUERY_SESSION", "") == "1"
+    if single_query and (platform or "cli") == "cli":
+        return ONESHOT_SOURCE
+    return platform or "cli"
+
+
 def is_attended(agent: Any) -> bool:
     """A delegated child answers its parent, not a person, though its copied context still carries
     the parent's source; a library caller (no platform) has no one reading either."""
