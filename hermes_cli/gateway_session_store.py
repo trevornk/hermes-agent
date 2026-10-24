@@ -70,6 +70,7 @@ class GatewaySessionStore:
         self.current: dict | None = None
         self._reader = None
         self._create_parameters = None
+        self._create_source_names: frozenset = frozenset()
 
     def __bool__(self):
         return not self.connection.final
@@ -162,11 +163,12 @@ class GatewaySessionStore:
         """``session.create`` with the launch policy (and ``title``: the owner's resolve -> create ->
         title step); adopts and returns the new session id. ``record_cwd=False`` (``/new``,
         ``--create-if-missing``) leaves the row's cwd empty, as main's explicit creates did."""
-        from agent.session_source import CLI_FAMILY_SOURCES, session_source_for
+        from agent.session_source import CLI_FAMILY_SOURCES, creatable_session_source
         params = _creation_policy(launch or {})
         params["cwd"] = os.path.realpath(os.getenv("TERMINAL_CWD") or os.getcwd())
-        # Main's row label: ``cli``, ``oneshot`` for a finite -q/-Q run, or an explicit --source.
-        params["source"] = session_source_for("cli")
+        # Main's row label: ``cli``, ``oneshot`` for a finite -q/-Q run, or an explicit --source. An
+        # inherited label the owner cannot create (a kanban/cron worker's) falls back to those.
+        params["source"] = creatable_session_source("cli", self._create_sources())
         # Main's row stamp (run_agent._launch_cwd_for_session): this process's cwd (``-w`` never
         # chdirs, so the repo root), only for a CLI-family label on a local terminal backend.
         local = (os.getenv("TERMINAL_ENV") or "local").strip().lower() in ("", "local")
@@ -183,11 +185,25 @@ class GatewaySessionStore:
     def client_env(self):
         """This shell's ``client_env`` when the gateway takes it (one ``runtime.describe`` per store)."""
         from hermes_cli.gateway_chat import client_env_policy
+        self._describe_create()
+        return client_env_policy(self._create_parameters)
+
+    def _describe_create(self):
+        """The owner's ``session_create`` contract (one ``runtime.describe`` per store)."""
         if self._create_parameters is None:
             described = self.call("runtime.describe")
             contract = described.get("session_create") if isinstance(described, dict) else None
             self._create_parameters = list((contract or {}).get("parameters") or [])
-        return client_env_policy(self._create_parameters)
+            self._create_source_names = frozenset((contract or {}).get("sources") or ())
+
+    def _create_sources(self):
+        """The source labels ``session.create`` accepts: the owner's advertised set, else this
+        install's own (an owner predating the advertisement validates against the same table)."""
+        self._describe_create()
+        if self._create_source_names:
+            return self._create_source_names
+        from gateway.session_policy import SURFACES
+        return frozenset(SURFACES)
 
     def branch(self, session_id, title=None):
         """``session.mutate branch``: the gateway forks the whole active transcript into a child it
