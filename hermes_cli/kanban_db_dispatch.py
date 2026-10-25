@@ -1574,7 +1574,9 @@ def check_respawn_guard(
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
     handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
+    PR — or the latest run, ended after it, is the same profile's
+    iteration-budget exhaustion that the dispatcher re-queued to continue).
+    The review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
@@ -1656,6 +1658,11 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
+    #    Nor is a wall-clock max_runtime kill. An iteration-budget exhaustion
+    #    is different: the dispatcher itself re-queued that run to continue, so
+    #    when it is the latest run, by the profile still on the card, and ended
+    #    after the newest PR comment, the retry is that implementer finishing its
+    #    own PR (whose URL is in the context it inherits), not a duplicate.
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
                 if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
@@ -1664,6 +1671,8 @@ def check_respawn_guard(
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
                 conn, "task_events", task_id, max(pr_times),
                 "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
+            return None
+        if _is_budget_continuation(conn, task_id, max(pr_times)):
             return None
         return "active_pr"
 
@@ -1686,6 +1695,28 @@ def _rows_since(conn: sqlite3.Connection, table: str, task_id: str, since: int, 
         t = unreadable if t is None else t
         if t is not None and (t > since if strict else t >= since):
             yield t, row
+
+
+def _is_budget_continuation(conn: sqlite3.Connection, task_id: str, since: int) -> bool:
+    """True when the card's latest ended run is a graceful iteration-budget
+    ``timed_out`` (its metadata carries ``budget_max``; a max_runtime kill
+    records ``limit_seconds`` instead) that ended strictly after ``since`` and
+    was run by the profile still assigned. Anything else fails closed."""
+    row = conn.execute(
+        "SELECT r.outcome, r.ended_at, r.metadata, r.profile, t.assignee "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.task_id = ? AND r.ended_at IS NOT NULL "
+        "ORDER BY r.ended_at DESC, r.id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["outcome"] != "timed_out":
+        return False
+    ended_at = _kb._to_epoch(row["ended_at"])
+    if ended_at is None or ended_at <= since:
+        return False
+    if _kb._json_dict(row["metadata"]).get("budget_max") is None:
+        return False
+    return bool(row["profile"]) and row["profile"] == row["assignee"]
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
