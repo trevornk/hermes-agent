@@ -174,6 +174,9 @@ def kanban_command(args: argparse.Namespace) -> int:
         if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
             return _err(f"kanban: board {normed!r} does not exist. "
                         f"Create it with `hermes kanban boards create {normed}`.")
+        refusal = kb.fenced_cross_board_refusal(normed)
+        if refusal:
+            return _err(f"kanban: {refusal}")
         board_scope = kb.scoped_current_board(normed)
 
     with board_scope:
