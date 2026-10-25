@@ -19244,6 +19244,22 @@ def test_periodic_trim_runs_once_every_session_is_quiescent(monkeypatch):
             server._sessions.clear()
 
 
+def test_periodic_reaper_trim_skips_the_full_collection(monkeypatch):
+    """The reaper is a timer lane: allocator trim only, no full gc.collect() holding the GIL every
+    scan (#139763: 1.2-3.9 s per scan observed on macOS)."""
+    from hermes_cli import mem_trim
+
+    kwargs = []
+    _periodic_trim_calls(monkeypatch)
+    monkeypatch.setattr(mem_trim, "trim_memory", lambda **kw: kwargs.append(kw) or True)
+    server._sessions.clear()
+    try:
+        server._reap_idle_sessions()
+    finally:
+        server._sessions.clear()
+    assert kwargs == [{"reason": "idle reaper periodic trim", "collect": False}]
+
+
 def test_turn_completion_trim_skips_while_another_session_is_running(monkeypatch):
     """Only OTHER sessions gate the post-turn trim: a sole session trims at every turn end; a second in-flight turn defers it (#58576)."""
     calls = _periodic_trim_calls(monkeypatch)

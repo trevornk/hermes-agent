@@ -29,4 +29,6 @@ def test_gateway_housekeeping_calls_periodic_memory_trim(monkeypatch):
 
     gateway_run._start_gateway_housekeeping(_OneTickStopEvent(), interval=0)
 
-    assert calls == [{"reason": "messaging gateway housekeeping"}]
+    # Timer lane: allocator trim only. A forced full gc.collect() here held the GIL for 1-9.7 s
+    # once a minute on a live gateway (#139763), past the worker WebSocket open timeout.
+    assert calls == [{"reason": "messaging gateway housekeeping", "collect": False}]

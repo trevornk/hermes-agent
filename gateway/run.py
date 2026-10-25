@@ -4484,9 +4484,10 @@ def _housekeeping_deferred_fts_retry() -> None:
 
 
 def _housekeeping_memory_trim() -> None:
-    """Messaging-gateway counterpart to the TUI idle reaper; config-gated and rate-limited inside."""
+    """Messaging-gateway counterpart to the TUI idle reaper; config-gated and rate-limited inside.
+    Timer lane, so allocator trim only: no full gc.collect() stalling every thread each tick (#139763)."""
     from hermes_cli.mem_trim import trim_memory
-    trim_memory(reason="messaging gateway housekeeping")
+    trim_memory(reason="messaging gateway housekeeping", collect=False)
 
 
 def _housekeeping_checkpoint_prune() -> None:

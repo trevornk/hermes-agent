@@ -173,12 +173,22 @@ def _probe_glibc_malloc_trim() -> Callable[[int], int] | None:
 
 
 def trim_memory(
-    *, force: bool = False, reason: str = "", cooldown_seconds: float | None = None) -> bool:
+    *, force: bool = False, reason: str = "", cooldown_seconds: float | None = None,
+    collect: bool = True) -> bool:
     """Collect cycles and ask glibc to release free heap pages.
 
     Returns ``True`` only when ``malloc_trim(0)`` ran and reported success. Unsupported allocators,
     the config kill switch, cooldown suppression, and all runtime errors return ``False`` without
     affecting the caller.
+
+    ``collect=False`` is for periodic timer lanes (gateway housekeeping, TUI idle reaper): it skips
+    the full ``gc.collect()`` and only asks the allocator to return already-free pages. A full
+    collection walks the whole tracked heap under the GIL, so on a fixed cooldown it froze every
+    thread of a long-lived gateway once a minute (#139763; 1-9.7 s on a macOS gateway whose heap was
+    partly compressed/swapped). CPython's own collector still reclaims cycles; the pressure lanes
+    (agent close, large tool result, post-compression, turn completion) keep the collection. Without
+    a page-release primitive such a call does nothing, so it returns before claiming the cooldown
+    and cannot suppress a pressure lane's collection.
     """
     enabled, configured_cooldown, log_every_n, info_log_min_delta_mb = _config_settings()
     if not enabled:
@@ -187,6 +197,8 @@ def trim_memory(
     global _last_trim_monotonic, _trim_call_count
     with _trim_lock:
         trim = _probe_glibc_malloc_trim()
+        if not collect and trim is None:
+            return False
         now = time.monotonic()
         cooldown = configured_cooldown if cooldown_seconds is None else _cooldown_seconds(cooldown_seconds)
         since_last = now - _last_trim_monotonic
@@ -199,9 +211,10 @@ def trim_memory(
             before = collect_memory_snapshot()
             counts = gc.get_count()
             started = time.perf_counter()
-            collected = gc.collect()
-            _note_collection(reason or "cleanup", (time.perf_counter() - started) * 1000, collected,
-                             counts, before.get("thread_count"))
+            if collect:
+                collected = gc.collect()
+                _note_collection(reason or "cleanup", (time.perf_counter() - started) * 1000, collected,
+                                 counts, before.get("thread_count"))
             # Cycle collection is allocator-independent; only the page release needs glibc.
             trim_result = trim(0) if trim is not None else 0
             released = bool(trim_result)
