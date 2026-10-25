@@ -385,6 +385,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                 "active children still need workspace at %s",
                 kind, task_id, path,
             )
+            # This task just became terminal, so a finished parent whose
+            # children are now all terminal can still be swept.
+            _try_cleanup_parent_workspaces(conn, task_id)
             return
         # Kill the (dead) tmux worker session BEFORE removing a worktree so a
         # lingering worker never has its cwd deleted from under it.
@@ -496,43 +499,66 @@ def _cleanup_worktree_workspace(
         pass  # best-effort — never block completion
 
 
-def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
+def _try_cleanup_parent_workspaces(
+    conn: sqlite3.Connection, task_id: str, _seen: Optional[set[str]] = None
+) -> None:
     """Run the deferred cleanup of any parent scratch/worktree workspace whose
     children are now all done/archived/failed/cancelled (called after each
     child completes).
 
+    Climbs through every terminal ancestor that has no active children, so a
+    grandparent left in place while a middle task was still deferred is
+    revisited once that middle task is released. Climbing stops at the first
+    ancestor that is still live or still has a live child.
+
     See #33774.
     """
+    seen = _seen if _seen is not None else {task_id}
     try:
         parents = conn.execute(
             "SELECT parent_id FROM task_links WHERE child_id = ?",
             (task_id,),
         ).fetchall()
         for (parent_id,) in parents:
-            row = conn.execute(_WORKSPACE_ROW_SQL, (parent_id,)).fetchone()
+            if parent_id in seen:
+                continue
+            seen.add(parent_id)
             if (
-                not row
-                or row["workspace_kind"] not in _REMOVABLE_KINDS
-                or not row["workspace_path"]
-                or not _is_terminal_task(conn, parent_id)
+                not _is_terminal_task(conn, parent_id)
                 or _has_active_children(conn, parent_id)
             ):
                 continue
-            ws_path = row["workspace_path"]
-            if row["workspace_kind"] == "worktree":
-                if _defer_shared_worktree_cleanup(conn, parent_id, ws_path):
-                    continue
-                _cleanup_worktree_workspace(parent_id, ws_path, row["branch_name"])
-                continue
-            wp = Path(ws_path)
-            if not wp.is_dir():
-                continue
-            if _is_managed_scratch_path(wp):
-                if _defer_shared_workspace_cleanup(conn, parent_id, ws_path):
-                    continue
-                release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+            _cleanup_released_parent_workspace(conn, parent_id)
+            _try_cleanup_parent_workspaces(conn, parent_id, seen)
+    except Exception:
+        pass  # best-effort
+
+
+def _cleanup_released_parent_workspace(conn: sqlite3.Connection, parent_id: str) -> None:
+    """Remove a terminal parent's deferred workspace once no child needs it."""
+    try:
+        row = conn.execute(_WORKSPACE_ROW_SQL, (parent_id,)).fetchone()
+        if (
+            not row
+            or row["workspace_kind"] not in _REMOVABLE_KINDS
+            or not row["workspace_path"]
+        ):
+            return
+        ws_path = row["workspace_path"]
+        if row["workspace_kind"] == "worktree":
+            if _defer_shared_worktree_cleanup(conn, parent_id, ws_path):
+                return
+            _cleanup_worktree_workspace(parent_id, ws_path, row["branch_name"])
+            return
+        wp = Path(ws_path)
+        if not wp.is_dir():
+            return
+        if _is_managed_scratch_path(wp):
+            if _defer_shared_workspace_cleanup(conn, parent_id, ws_path):
+                return
+            release_lsp_clients(str(wp))
+            shutil.rmtree(wp, ignore_errors=True)
+            _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
         pass  # best-effort
 
