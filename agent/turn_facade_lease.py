@@ -247,8 +247,13 @@ class DurableTurnLease:
                     self._current_session_id(),
                 )
                 return None
+            from hermes_state_errors import classify_persistence_error
+
+            # Typed cause for the worker's exit policy: a renewal the owner never answered is the
+            # owner link failing, not the card's work (``turn_exit.owner_transport_failed``).
+            self.agent._lease_refresh_failure_cause = classify_persistence_error(exc)
             logger.warning(
-                "Failed to refresh session turn lease: %s", self._current_session_id(), exc_info=True,
+                "Failed to refresh session turn lease: %s (%s)", self._current_session_id(), exc, exc_info=True,
             )
             self._interrupt_turn(
                 "Session turn lease could not be refreshed; stopping to protect the transcript."

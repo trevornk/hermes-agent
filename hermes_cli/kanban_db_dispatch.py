@@ -26,7 +26,8 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
-from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.kanban_owner_recovery import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE, owner_backoff_seconds
+from hermes_cli.kanban_worker_log import _worker_final_output, _worker_log_exit_code
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -142,6 +143,10 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    owner_unavailable: list[str] = field(default_factory=list)
+    """Task ids whose attempt never reached its profile owner (EX_UNAVAILABLE
+    sentinel, fenced to the run) and were released WITHOUT counting a failure;
+    ``check_respawn_guard`` spaces the retries (``owner_backoff``)."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -170,6 +175,8 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.owner_unavailable:
+            counts["owner_unavailable"] = counts.get("owner_unavailable", 0) + len(res.owner_unavailable)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -251,28 +258,9 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("rate_limited", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
+    if code == KANBAN_OWNER_UNAVAILABLE_EXIT_CODE:
+        return ("owner_unavailable", code)
     return ("nonzero_exit", code)
-
-
-_EXIT_TRAILER_RE = re.compile(
-    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)\s*$", re.MULTILINE,
-)
-
-
-def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional[int]:
-    """Exit code from the trailer the worker CLI wrote to its own log; None when absent.
-
-    The durable twin of ``_recent_worker_exits``: written by the worker itself
-    (``hermes_cli.quiet_single_query.exit_single_query``), so it is there whether
-    or not the process running this sweep ever reaped the worker. Last trailer
-    wins — the log is append-mode across re-runs.
-    """
-    try:
-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
-    except Exception:
-        return None
-    matches = _EXIT_TRAILER_RE.findall(raw or "")
-    return int(matches[-1]) if matches else None
 
 
 def reap_worker_zombies() -> list[int]:
@@ -960,8 +948,8 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
-            continue
+        if outcome in ("rate_limited", "owner_unavailable"):
+            continue  # neither says anything about the task
         if outcome == "crashed" and (
             _kb._json_dict(row["metadata"]).get("protocol_violation")
             or "protocol violation" in (row["error"] or "")
@@ -989,54 +977,6 @@ _PROTOCOL_VIOLATION_ERROR = (
 )
 
 
-# Rich panel/rule chrome around the rendered response, and the CLI's own preamble lines.
-_LOG_CHROME = re.compile(r"[─━═╭╮╰╯│┃┌┐└┘]+|☤\s*Hermes")
-
-
-def _exit_summary_marker() -> str:
-    """The CLI exit-summary header (``cli_session_mixin.show_exit_summary``), in the active language."""
-    from agent.i18n import t
-    return t("cli.session.exit_resume_hint")
-
-
-def _log_noise_prefixes() -> tuple[str, ...]:
-    from agent.i18n import t
-    return ("session_id:", "Query:", t("cli.chat.initializing_agent"))
-
-
-def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
-    """Best-effort read of a dead worker's last printed text, for the board diagnostic.
-
-    A ``chat -q`` worker's stdout/stderr are redirected to its per-task log
-    (``_default_spawn``), so when it exits without a terminal board call the
-    reason is usually sitting there: the model's own explanation of why it could
-    not comply (#88603), or the rendered provider error (#46593). The reap used to
-    discard it in favour of a canned message on every retry. Trims the CLI exit
-    summary, rule lines and the ``session_id:`` trailer; returns "" (never raises)
-    on a missing/empty log.
-
-    ``board`` must come from the dispatching tick: ambient current-board resolution
-    is wrong for every board but the one the dispatcher thread happens to call
-    "current", so the log would silently not be found.
-    """
-    try:
-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
-    except Exception:
-        return ""
-    if not raw:
-        return ""
-    raw = _EXIT_TRAILER_RE.sub("", raw)
-    cut = raw.rfind(_exit_summary_marker())
-    if cut != -1:
-        raw = raw[:cut]
-    lines = []
-    for ln in raw.splitlines():
-        ln = _LOG_CHROME.sub("", ln).strip()
-        if ln and not ln.startswith(_log_noise_prefixes()):
-            lines.append(ln)
-    return " ".join(lines)[-400:]
-
-
 @dataclass
 class _DeadWorker:
     """How ``detect_crashed_workers`` should book one dead worker."""
@@ -1051,12 +991,22 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    owner_unavailable: bool = False
+    """``KANBAN_OWNER_UNAVAILABLE_EXIT_CODE`` from the run's own fenced receipt:
+    the attempt never reached its owner — requeued unspent, spaced by backoff."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
+        # doesn't show a phantom crash for a quota wall; an unreachable owner likewise.
+        if self.rate_limited:
+            return "rate_limited"
+        return "owner_unavailable" if self.owner_unavailable else "crashed"
+
+    @property
+    def unspent(self) -> bool:
+        """Booked without ``_record_task_failure``: no counter, no breaker."""
+        return self.rate_limited or self.protocol_violation or self.owner_unavailable
 
 
 def _classify_dead_worker(
@@ -1071,6 +1021,7 @@ def _classify_dead_worker(
     """
     dead = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board)
     if task_id and not dead.rate_limited:
+        # (An owner-unavailable submitter's last words ARE the transport diagnostic.)
         worker_output = _worker_final_output(task_id, board=board)
         if worker_output:
             dead.error_text += f" Worker's last output: {worker_output!r}"
@@ -1102,6 +1053,20 @@ def _classify_dead_worker_exit(
         logged = _worker_log_exit_code(task_id, board=board)
         if logged is not None:
             kind, code = _exit_code_kind(logged)
+            if kind == "owner_unavailable":
+                # The log is append-mode across attempts, so a trailer alone cannot prove THIS
+                # run never reached its owner; the fenced ``worker_result`` receipt (read into
+                # ``exit_code`` by the sweep) is the only evidence that earns the unspent requeue.
+                kind = "nonzero_exit"
+    if kind == "owner_unavailable":
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} could not reach the profile owner (exit {code}): the claim was never "
+            "submitted — requeued without counting a failure; retried after a backoff.",
+            "owner_unavailable",
+            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "infrastructure": True},
+            owner_unavailable=True,
+        )
     if kind == "clean_exit":
         # rc=0 while still ``running``: usually the work succeeded and only the
         # paperwork was skipped; the corrective sentence reaches the retry
@@ -1155,6 +1120,7 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    owner_unavailable: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1222,7 +1188,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.unspent:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
@@ -1234,6 +1200,10 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+            elif dead.owner_unavailable:
+                # Never in ``crash_details``: no counter, no same-error breaker — four
+                # submitters failing to dial one stalled owner is one host condition.
+                sweep.owner_unavailable.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -1338,6 +1308,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_owner_unavailable = sweep.owner_unavailable  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1570,6 +1541,20 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _owner_unavailable_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Trailing consecutive ``owner_unavailable`` runs, newest first (bounded scan)."""
+    rows = conn.execute(
+        "SELECT outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT ?", (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
+    ).fetchall()
+    streak = 0
+    for row in rows:
+        if row["outcome"] != "owner_unavailable":
+            break
+        streak += 1
+    return streak
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1578,7 +1563,9 @@ def check_respawn_guard(
     Called per ready/review row before any claim attempt. Priority order:
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
     refused — no restart-safe scope — within the cooldown; never counted),
-    ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
+    ``"owner_backoff"`` (latest run ``owner_unavailable``: the attempt never
+    reached its owner; held for ``owner_backoff_seconds`` of the trailing streak,
+    never counted), ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
     path never increments ``consecutive_failures``), ``"blocker_auth"``
@@ -1617,6 +1604,15 @@ def check_respawn_guard(
             ended_at = _kb._to_epoch(latest_run["ended_at"])
             if ended_at is not None and (now - ended_at) < rl_cooldown:
                 return "infrastructure_cooldown"
+    if latest_run is not None and latest_run["outcome"] == "owner_unavailable":
+        # Bounded exponential backoff over the trailing owner-unavailable streak; like the
+        # rate-limit path it retries forever, spaced, and skips blocker_auth (the stamped
+        # transport diagnostic is not an auth verdict). A real run supersedes it.
+        ended_at = _kb._to_epoch(latest_run["ended_at"])
+        hold = owner_backoff_seconds(_owner_unavailable_streak(conn, task_id))
+        if ended_at is not None and (now - ended_at) < hold:
+            return "owner_backoff"
+        return None
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, skipping blocker_auth so
@@ -2245,6 +2241,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.owner_unavailable.extend(getattr(detect_crashed_workers, "_last_owner_unavailable", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 

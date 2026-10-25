@@ -28,11 +28,21 @@ _DEFAULT_INFO_LOG_MIN_DELTA_MB = 0.0
 # that stacks N+1 uncooled full gc.collect() passes (50-500ms each in a large gateway
 # process). 5s coalesces the burst while keeping the parent's final close-trim effective.
 _FORCE_FLOOR_SECONDS = 5.0
+# A full collection holds the GIL for its whole duration: every event loop in the process (owner
+# sockets, worker receipts, adapter I/O) is paused meanwhile. Past this it is logged at WARNING
+# whether or not the host has a page-release primitive (macOS never reached the success log).
+_SLOW_GC_WARN_MS = 1000.0
+# At most one slow-collection warning per floor; the next one carries the suppressed count.
+_SLOW_GC_LOG_FLOOR_SECONDS = 60.0
 _trim_lock = threading.Lock()
 _last_trim_monotonic = 0.0
 _probe_done = False
 _malloc_trim: Callable[[int], int] | None = None
 _trim_call_count = 0
+_last_slow_gc_log_monotonic = 0.0
+_slow_gc_suppressed = 0
+# The most recent collection, for canaries: ``{"reason", "gc_ms", "collected", "threads", "at"}``.
+last_collection: dict[str, Any] = {}
 
 
 def _config_settings() -> tuple[bool, float, int, float]:
@@ -119,6 +129,29 @@ def _should_log_trim(
     return abs(after_rss - before_rss) >= info_log_min_delta_mb * 1024
 
 
+def _note_collection(reason: str, gc_ms: float, collected: int, counts: tuple, threads: int | None) -> None:
+    """Record the collection and log it: DEBUG normally, a rate-limited WARNING when slow.
+
+    Timing is observability only — nothing here changes when or how often collection runs."""
+    global _last_slow_gc_log_monotonic, _slow_gc_suppressed
+    last_collection.update(reason=reason, gc_ms=gc_ms, collected=collected, threads=threads, at=time.time())
+    if gc_ms < _SLOW_GC_WARN_MS:
+        logger.debug("gc.collect: reason=%s duration_ms=%.1f collected=%s gen_counts=%s threads=%s",
+                     reason, gc_ms, collected, counts, threads)
+        return
+    now = time.monotonic()
+    if _last_slow_gc_log_monotonic and now - _last_slow_gc_log_monotonic < _SLOW_GC_LOG_FLOOR_SECONDS:
+        _slow_gc_suppressed += 1
+        return
+    suppressed, _slow_gc_suppressed = _slow_gc_suppressed, 0
+    _last_slow_gc_log_monotonic = now
+    logger.warning(
+        "slow gc.collect: reason=%s duration_ms=%.1f collected=%s gen_counts=%s threads=%s "
+        "suppressed_since_last=%d (the GIL was held for the whole collection: every event loop in "
+        "this process, owner sockets and worker receipts included, paused meanwhile)",
+        reason, gc_ms, collected, counts, threads, suppressed)
+
+
 def _probe_glibc_malloc_trim() -> Callable[[int], int] | None:
     """Resolve glibc's malloc_trim once; return None on unsupported systems."""
     global _malloc_trim, _probe_done
@@ -164,8 +197,11 @@ def trim_memory(
         _last_trim_monotonic = now
         try:
             before = collect_memory_snapshot()
+            counts = gc.get_count()
             started = time.perf_counter()
-            gc.collect()
+            collected = gc.collect()
+            _note_collection(reason or "cleanup", (time.perf_counter() - started) * 1000, collected,
+                             counts, before.get("thread_count"))
             # Cycle collection is allocator-independent; only the page release needs glibc.
             trim_result = trim(0) if trim is not None else 0
             released = bool(trim_result)

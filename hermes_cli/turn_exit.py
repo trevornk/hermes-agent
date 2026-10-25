@@ -15,10 +15,14 @@ TERMINAL_PROVIDER_REASONS = frozenset({
 
 def turn_exit_code(
     result, *, kanban_worker: bool, credentials_rate_limited: bool = False,
-    credentials_terminal: bool = False,
+    credentials_terminal: bool = False, owner_unavailable: bool = False,
     transient_reasons=TRANSIENT_PROVIDER_REASONS, terminal_reasons=TERMINAL_PROVIDER_REASONS,
 ) -> int:
-    """Preserve completion, interruption and retryable/terminal provider outcomes."""
+    """Preserve completion, interruption and retryable/terminal provider outcomes.
+
+    ``owner_unavailable``: the worker's owner link failed (no receipt, no owner to dial) and the
+    turn did not complete because of it — the card's infrastructure outcome, never a provider or
+    credential verdict. A completed turn is still 0; a provider-terminal result stays terminal."""
     if not isinstance(result, dict):
         if credentials_rate_limited and kanban_worker:
             from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
@@ -26,20 +30,48 @@ def turn_exit_code(
         if credentials_terminal and kanban_worker:
             from hermes_cli.kanban_db import KANBAN_TERMINAL_PROVIDER_EXIT_CODE
             return KANBAN_TERMINAL_PROVIDER_EXIT_CODE
+        if owner_unavailable and kanban_worker:
+            from hermes_cli.kanban_owner_recovery import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
+            return KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
         return 1
     if result.get("interrupted"):
+        if owner_unavailable and kanban_worker:
+            from hermes_cli.kanban_owner_recovery import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
+            return KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
         return 130
     if not (result.get("failed") or result.get("partial") or result.get("completed") is False):
         return 0
     if kanban_worker:
         reason = result.get("failure_reason")
-        if reason in transient_reasons:
-            from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
-            return KANBAN_RATE_LIMIT_EXIT_CODE
         if reason in terminal_reasons:
             from hermes_cli.kanban_db import KANBAN_TERMINAL_PROVIDER_EXIT_CODE
             return KANBAN_TERMINAL_PROVIDER_EXIT_CODE
+        if owner_unavailable:
+            from hermes_cli.kanban_owner_recovery import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
+            return KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
+        if reason in transient_reasons:
+            from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+            return KANBAN_RATE_LIMIT_EXIT_CODE
     return 1
+
+
+def owner_transport_failed(agent=None, exc=None) -> bool:
+    """True when the worker's owner link, not its work, ended the attempt.
+
+    Evidence is typed, never a log tail: the agent's recorded persistence cause for this turn
+    (``_last_persistence_error_cause`` / ``_lease_refresh_failure_cause``, both classified by
+    ``classify_persistence_error``) or an ``owner_transport`` error in ``exc``'s cause chain."""
+    from hermes_state_errors import classify_persistence_error
+    for attr in ("_last_persistence_error_cause", "_lease_refresh_failure_cause"):
+        if agent is not None and getattr(agent, attr, None) == "owner_transport":
+            return True
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if classify_persistence_error(exc) == "owner_transport":
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 def credential_failure_flags(exc) -> dict:
