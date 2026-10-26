@@ -6,6 +6,25 @@ import sqlite3
 import time
 import psutil
 
+# Worker exit "the profile owner could not be reached": the dispatcher's submitter never got a
+# socket to the owner (gateway stalled, draining past its wait, connect refused), so nothing about
+# the card ran. Released WITHOUT counting a failure, spaced by ``owner_backoff_seconds``. An owner
+# that ANSWERED (a refusal, a stale claim) is never this code. 69 == BSD EX_UNAVAILABLE; the
+# siblings 75/78 live beside the claim constants in ``kanban_db``.
+KANBAN_OWNER_UNAVAILABLE_EXIT_CODE = 69
+
+# Requeue spacing after an ``owner_unavailable`` run: doubles per consecutive owner-unavailable
+# run, from the first retry's delay up to the cap. Bounded so a dead owner never spins the card
+# every tick and a recovered owner is retried within a tick or two.
+OWNER_BACKOFF_BASE_SECONDS = 60
+OWNER_BACKOFF_MAX_SECONDS = 1800
+
+
+def owner_backoff_seconds(streak: int) -> int:
+    """Seconds to hold a card after its ``streak``-th consecutive owner-unavailable run."""
+    exponent = max(int(streak), 1) - 1
+    return min(OWNER_BACKOFF_BASE_SECONDS << min(exponent, 30), OWNER_BACKOFF_MAX_SECONDS)
+
 
 def owner_reclaim_paused(conn, task_id):
     """Missing/ambiguous owner receipts never authorize another attempt."""

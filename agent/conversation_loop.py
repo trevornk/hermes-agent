@@ -1703,6 +1703,7 @@ def _run_conversation_turn(
     agent._delivered_interim_texts = set()
     agent._incremental_persistence_failed = False
     agent._last_persistence_error_cause = None
+    agent._lease_refresh_failure_cause = None
     agent._compression_adoption_failed = False
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}

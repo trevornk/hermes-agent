@@ -132,7 +132,10 @@ isolation, one fleet serving several businesses). After `kanban.failure_limit` c
 non-success attempts on a task (default 2) the dispatcher auto-blocks it to stop spin loops; a
 worker exit of `KANBAN_TERMINAL_PROVIDER_EXIT_CODE` (78 — credential revoked, model gone; the
 worker's own `failure_reason` classification via `cli._TERMINAL_PROVIDER_REASONS`) trips it on
-the first attempt, sticky, because no retry can heal it (#114587).
+the first attempt, sticky, because no retry can heal it (#114587). `KANBAN_OWNER_UNAVAILABLE_EXIT_CODE`
+(69) is the submitter's connect-phase verdict (no socket to the owner, nothing submitted): booked
+`owner_unavailable` from the run's fenced `worker_result` receipt only (never a log-tail trailer),
+requeued unspent and spaced by `owner_backoff_seconds`; an owner that answered is never transient.
 Process-identity note: `kanban --preserve-cache` contains "serve" — never classify processes by argv
 substring (root). Worker liveness is `(worker_pid, worker_started_at)` — the start-time fingerprint
 (`gateway.status.get_process_start_time`) recorded at claim time — never bare PID existence, or a
