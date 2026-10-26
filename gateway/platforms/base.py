@@ -3502,14 +3502,57 @@ class BasePlatformAdapter(ABC):
             await add(chat_id, message_id, emoji)
 
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
-        """Run a lifecycle hook without letting failures break message flow."""
+        """Run a lifecycle hook without letting failures break message flow.
+
+        An admission-gate rejection (confirmed-unauthorized sender) stamps the event's
+        ``_hooks_suppressed`` via ``_precheck_hook_suppression`` before ``on_processing_start``
+        fires; that flag suppresses BOTH hooks here. Without this an unauthorized/dropped message
+        was reported as ``ProcessingOutcome.SUCCESS`` (the handler returns ``None``, which reads
+        the same as "successfully processed, nothing to say"), leaking a full 👀→✅ reaction pair
+        onto a message the gateway never actually admitted."""
         hook = getattr(self, hook_name, None)
         if not callable(hook):
+            return
+        _hook_event = args[0] if args else None
+        if getattr(_hook_event, "_hooks_suppressed", False):
             return
         try:
             await hook(*args, **kwargs)
         except Exception as e:
             logger.warning("[%s] %s hook failed: %s", self.name, hook_name, e)
+
+    def _precheck_hook_suppression(self, event: MessageEvent) -> None:
+        """Peek at the sender's authorization BEFORE ``on_processing_start`` fires, and stamp
+        ``event._hooks_suppressed`` on a confirmed rejection so neither lifecycle hook runs for a
+        turn the gateway's own admission gate (``_hm_admit_event`` -> ``_is_user_authorized_for_source``)
+        is about to drop.
+
+        Uses ``_is_sender_authorized``, which reads the SAME ``_authorization_check`` callback the
+        runner wires via ``set_authorization_check`` (built by ``_make_adapter_auth_check``,
+        delegating to the identical ``_is_user_authorized`` chain the real gate consults) — a pure,
+        side-effect-free peek. It never sends a pairing code or decline notice; those side effects
+        stay exclusively in ``_hm_admit_event``, which still runs immediately after and produces
+        the actual (identical) verdict.
+
+        Only a confirmed ``False`` suppresses. ``None`` ("unknown" — no authorization check wired,
+        e.g. bare test adapters and internal/no-user-id events) and ``True`` leave both hooks
+        untouched, so every adapter/test that never calls ``set_authorization_check`` keeps its
+        pre-fix behavior exactly."""
+        source = getattr(event, "source", None)
+        if source is None or getattr(event, "internal", False):
+            return
+        # No check wired (including adapters built via ``object.__new__`` that skip ``__init__``,
+        # where the attribute does not exist yet) is "unknown": leave both hooks untouched.
+        if getattr(self, "_authorization_check", None) is None:
+            return
+        user_id = getattr(source, "user_id", None)
+        if not user_id:
+            return
+        verdict = self._is_sender_authorized(
+            user_id, getattr(source, "chat_type", None), getattr(source, "chat_id", None),
+            is_bot=bool(getattr(source, "is_bot", False)), thread_id=getattr(source, "thread_id", None))
+        if verdict is False:
+            event._hooks_suppressed = True
 
     @staticmethod
     def _is_retryable_error(error: Optional[str]) -> bool:
@@ -4027,6 +4070,10 @@ class BasePlatformAdapter(ABC):
         if session_key in self._active_sessions or behind_burst:
             await self._handle_message_while_active(event, session_key)
             return
+        # Peek at authorization BEFORE the background task's on_processing_start fires: a
+        # confirmed-unauthorized sender must never see a 👀 reaction that later gets reported as
+        # ProcessingOutcome.SUCCESS once the gateway's own admission gate drops it (#WINTOPPERS).
+        self._precheck_hook_suppression(event)
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
 

@@ -116,6 +116,14 @@ class MessageEvent:
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
+    # Set by ``BasePlatformAdapter.handle_message`` when a pre-check on the sender's identity
+    # already resolves to a confirmed-unauthorized sender. ``_run_processing_hook`` reads this to
+    # suppress BOTH on_processing_start and on_processing_complete for this event, so an
+    # unauthorized/ignored drop never leaks a 👀/✅ reaction that misreports the drop as a
+    # completed (ProcessingOutcome.SUCCESS) turn. Never set True on an authorized sender or an
+    # "unknown" (no authorization check wired) result — only a confirmed False from the
+    # authorization check suppresses.
+    _hooks_suppressed: bool = field(default=False, init=False, repr=False, compare=False)
 
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
         """One turn now answers *other* too: an addressed message wins, then an unknown one."""
