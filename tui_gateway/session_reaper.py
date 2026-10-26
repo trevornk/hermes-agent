@@ -281,7 +281,8 @@ def _reap_idle_sessions() -> None:
         return
     try:
         from hermes_cli.mem_trim import trim_memory
-        trim_memory(reason="idle reaper periodic trim")
+        # Timer lane: allocator trim only, no full gc.collect() holding the GIL every scan (#139763).
+        trim_memory(reason="idle reaper periodic trim", collect=False)
     except Exception as exc:  # debug, not warning — a persistent failure would repeat every scan.
         logger.debug("idle reaper memory trim failed: %s: %s", type(exc).__name__, exc)
 
