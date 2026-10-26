@@ -230,11 +230,51 @@ def _with_inherited_fallback(route: dict[str, Any], config: Mapping[str, Any]) -
     return route if inherited is None else {**route, "fallback_providers": inherited}
 
 
+def _fallback_route(route: dict[str, Any], parent_agent: Any, primary_exc: Exception,
+                    ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``(route, credentials)`` for the first ``fallback_providers`` entry that resolves, when the configured primary
+    cannot supply credentials (:class:`DelegationCredentialsUnavailable`: cooled-down pool, exhausted quota, expired
+    login). The child starts on that entry and keeps the entries after it as its own chain; the primary's
+    endpoint, key and per-route tuning do not carry over. With no usable entry the primary's error is re-raised
+    unchanged, so a route without a chain behaves exactly as it did."""
+    from hermes_cli.fallback_config import get_fallback_chain, resolve_entry_api_key
+    from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
+    chain = get_fallback_chain({"fallback_providers": route.get("fallback_providers")})
+    for position, entry in enumerate(chain):
+        candidate: dict[str, Any] = {
+            "provider": entry["provider"], "model": entry["model"], "fallback_providers": chain[position + 1:],
+        }
+        if route.get("reasoning_effort") is not None:
+            candidate["reasoning_effort"] = route["reasoning_effort"]
+        if entry.get("base_url"):
+            # A direct endpoint with no key of its own would inherit the PARENT's key and send it there.
+            api_key = resolve_entry_api_key(entry)
+            if not api_key:
+                logger.warning("Delegation fallback entry %s/%s has a base_url but no api_key/key_env; skipped",
+                               entry["provider"], entry["model"])
+                continue
+            candidate["base_url"], candidate["api_key"] = entry["base_url"], api_key
+        try:
+            creds = _resolve_delegation_credentials(candidate, parent_agent)
+        except ValueError as exc:
+            logger.warning("Delegation fallback entry %s/%s cannot be used and was skipped: %s",
+                           entry["provider"], entry["model"], exc)
+            continue
+        logger.info("Delegation provider '%s' is unavailable (%s); starting the child on fallback_providers[%d] "
+                    "%s/%s", route.get("provider"), primary_exc, position, entry["provider"], entry["model"])
+        return candidate, creds
+    raise primary_exc
+
+
 def _resolve_route(route: dict[str, Any], parent_agent: Any, backend: str) -> TaskRoute:
     if route.get("profile"):
         return replace(_profile_route(_profile_home(route["profile"])), backend=backend)
     from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
-    creds = _resolve_delegation_credentials(route, parent_agent)
+    from tools.delegate_tool_config import DelegationCredentialsUnavailable
+    try:
+        creds = _resolve_delegation_credentials(route, parent_agent)
+    except DelegationCredentialsUnavailable as exc:
+        route, creds = _fallback_route(route, parent_agent, exc)
     if route.get("service_tier") not in (None, ""):
         from tools.delegate_tool_tuning import task_service_tier
         creds = {**creds, **task_service_tier(str(route["service_tier"]), creds, parent_agent)}
