@@ -2319,6 +2319,29 @@ class MatrixAdapter(BasePlatformAdapter):
         room_id = str(getattr(event, "room_id", ""))
         is_direct = bool(getattr(getattr(event, "content", None), "is_direct", False))
         inviter = str(getattr(event, "sender", ""))
+        # [carried, matrix_invite_target_guard.patch] mautrix's
+        # MembershipEventDispatcher fires InternalEventType.INVITE for *any*
+        # m.room.member state event with membership=invite that appears in a
+        # synced room's timeline/state — not just invites targeting this bot.
+        # In shared/bridged rooms we've already joined, bridge bots routinely
+        # invite other ghost users (Discord/Signal puppets) into the room,
+        # and those state events land here too. Without checking state_key
+        # against our own mxid, we log a spurious "rejecting invite ... from
+        # unauthorized user <bridge bot>" for every such invite, even though
+        # nothing was actually offered to us and there's nothing to reject.
+        #
+        # The comparison goes through _is_self_sender() rather than a raw
+        # equality check: some homeservers normalize the localpart case
+        # differently at different API surfaces, so a byte-comparison here
+        # would discard a *genuine* invite whose state_key differs from our
+        # resolved mxid only by casing or surrounding whitespace. It also
+        # gives us the right fallback — when our own mxid hasn't resolved
+        # yet, _is_self_sender() returns True defensively, so we fall
+        # through to the authorization gate instead of silently swallowing
+        # an invite we cannot yet attribute.
+        state_key = str(getattr(event, "state_key", "") or "")
+        if state_key and not self._is_self_sender(state_key):
+            return
         # Only authorized inviters — otherwise any federated user could pull the bot into rooms.
         if not self._is_authorized_user(inviter, str(room_id)):
             logger.warning("Matrix: rejecting invite to %s from unauthorized user %s", room_id, inviter)
