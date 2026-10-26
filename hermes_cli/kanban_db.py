@@ -559,6 +559,37 @@ def _board_path(
     return board_dir(slug) / leaf
 
 
+def fenced_cross_board_refusal(board: Optional[str]) -> Optional[str]:
+    """Error text when a fenced caller's explicit board would be silently pinned.
+
+    :func:`_board_path` keeps fenced callers (dispatched workers, delegated
+    descendants) on their ``HERMES_KANBAN_DB`` pin even when they name another
+    board — the isolation is intended, but quietly acting on the pinned board
+    while the caller asked for a different one misroutes creates and turns
+    reads into false "not found" answers. Caller-intent surfaces (model tools,
+    CLI ``--board``) call this first and refuse instead. ``None`` when the
+    board is omitted, no pin/fence applies, or it names the pinned board.
+    """
+    slug = _explicit_board_slug(board)
+    pin = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if slug is None or not pin or not _explicit_board_intent_pinned():
+        return None
+    env_slug = (os.environ.get("HERMES_KANBAN_BOARD") or "").strip().lower()
+    if slug == env_slug:
+        return None
+    own = kanban_home() / "kanban.db" if slug == DEFAULT_BOARD else board_dir(slug) / "kanban.db"
+    pinned = Path(pin).expanduser()
+    if own.resolve() == pinned.resolve():
+        return None
+    return (
+        f"board={slug!r} refused: this worker is fenced to its own board "
+        f"({env_slug or pinned}) and cannot read or write board {slug!r}. "
+        "Omit board= to act on your own board — a card created there with "
+        "assignee=<profile> is still dispatched to that profile — or ask the "
+        f"orchestrator/human to act on board {slug!r}."
+    )
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """``kanban.db`` path: ``HERMES_KANBAN_DB`` pins it (injected into workers);
     ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir."""
