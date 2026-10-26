@@ -28,6 +28,8 @@ def _pull_plugin_update(target: Path, pinned_msg, not_git_msg, before_pull=None,
     *pinned_msg(install_record)* / *not_git_msg()* build the caller-specific error text. Both paths
     scan the candidate tree the same way: *force* or a truthy *scan_decision_cb* accepts a caution
     verdict, nothing accepts a dangerous one."""
+    from pm.outer_transaction import refuse_plugin_swap
+    refuse_plugin_swap()
     metadata = _pc()._read_install_metadata()
     install_record = metadata.get(target.name, {})
     if install_record.get("pinned") is True:
