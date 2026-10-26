@@ -4356,6 +4356,8 @@ def test_config_sync_switches_unpinned_session(monkeypatch):
                 "pin_session_override": False,
                 "persist_override": False,
                 "count_switch": False,
+                "adopted_profile_intent": {"model": "new/model", "provider": "nous",
+                                           "base_url": "", "api_mode": ""},
             },
         )
     ]
