@@ -833,6 +833,51 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         rows = conn.execute(sql, params).fetchall()
         return [int(r["id"]) for r in rows], sum(_tool_calls_len(r["tool_calls"]) for r in rows)
 
+    def _stored_row_identity(self, role: Any, content: Any, tool_call_id: Any, tool_calls: Any, tool_name: Any,
+                             timestamp: Any) -> tuple:
+        """Identity of a message as :meth:`_insert_message_rows` persists it (role, encoded content, tool fields,
+        float timestamp or ``None``), so a handoff dict and its durable row compare equal."""
+        parsed = _parse_tool_calls(tool_calls)
+        try:
+            stamp = float(timestamp.timestamp()) if hasattr(timestamp, "timestamp") else float(timestamp)
+        except (TypeError, ValueError):
+            stamp = None
+        return (role, self._encode_content(content), tool_call_id, json.dumps(parsed) if parsed else None,
+                _scrub_surrogates(tool_name), stamp)
+
+    def _split_concurrent_tail(self, conn, session_id: str, watermark: int,
+                               compacted_messages: list[dict[str, Any]]) -> tuple[list[int], int, list[int]]:
+        """``(clone_ids, clone_tool_calls, represented_ids)`` over the active rows above *watermark*. A durable
+        row can already ride inside the compressor's handoff (a preflight compaction overlapping a live append,
+        or a generated handoff equal to a concurrent scaffold row). Each such occurrence is matched once, oldest
+        row first — timed identity, then untimed for handoff dicts without a timestamp — so the commit keeps the
+        row once instead of inserting it AND cloning it. Represented originals are superseded duplicates."""
+        timed: dict[tuple, int] = {}
+        untimed: dict[tuple, int] = {}
+        for message in compacted_messages:
+            identity = self._stored_row_identity(
+                message.get("role", "unknown"), message.get("content"), message.get("tool_call_id"),
+                message.get("tool_calls"), message.get("tool_name"), message.get("timestamp"))
+            pool, key = (untimed, identity[:-1]) if identity[-1] is None else (timed, identity)
+            pool[key] = pool.get(key, 0) + 1
+        clone_ids: list[int] = []
+        represented_ids: list[int] = []
+        clone_tool_calls = 0
+        for row in conn.execute(
+                "SELECT id, role, content, tool_call_id, tool_calls, tool_name, timestamp FROM messages "
+                "WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id", (session_id, watermark)).fetchall():
+            identity = self._stored_row_identity(
+                row["role"], row["content"], row["tool_call_id"], row["tool_calls"], row["tool_name"], row["timestamp"])
+            for pool, key in ((timed, identity), (untimed, identity[:-1])):
+                if pool.get(key, 0) > 0:
+                    pool[key] -= 1
+                    represented_ids.append(int(row["id"]))
+                    break
+            else:
+                clone_ids.append(int(row["id"]))
+                clone_tool_calls += _tool_calls_len(row["tool_calls"])
+        return clone_ids, clone_tool_calls, represented_ids
+
     def _clone_message_rows(self, conn, tail_ids: list[int], *, session_id: Optional[str] = None) -> None:
         """Pure-SQL clone of *tail_ids* as fresh live rows (new id/display order, active=1, compacted=0;
         message payload columns stay byte-exact and FTS triggers index the clones), into *session_id* when given."""
@@ -934,6 +979,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         platform_message_id, token counts, reasoning sidecars all survive byte-exact, and the FTS triggers
         index the clones naturally), and the originals are archived. NOTE: re-sequencing assigns the tail
         rows fresh ids; consumers that reference durable row ids re-resolve by content (see 3e8ab0610).
+        A tail row that *compacted_messages* already carries verbatim (a preflight compaction overlapping a
+        live append) is kept once: inserted from the handoff, not cloned again; its original takes rewind flags.
         """
         return self._execute_transcript_write(lambda conn: self._archive_and_compact_on_conn(
             conn, session_id, compacted_messages, model_config_patch=model_config_patch,
@@ -977,9 +1024,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
                 conn, session_id, compacted_messages, proved[0], tail_count=tail_count,
                 carried_messages=carried_messages, patched_model_config=patched_model_config, patch=patch,
                 merged_away=proved[1])
-        tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
-            conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
-            (session_id, int(watermark)))
+        tail_ids, tail_tool_calls, represented_ids = ([], 0, []) if watermark is None else (
+            self._split_concurrent_tail(conn, session_id, int(watermark), compacted_messages))
         # Rewind targets sit AT/BELOW the watermark (all the compressor saw); unbounded, a
         # concurrent append would steal a LIMIT slot.
         rewind_ids: list[int] = self._resolve_carried_row_ids(
@@ -991,7 +1037,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
                 "ORDER BY id DESC LIMIT ?",
                 (session_id, *((int(watermark),) if bound else ()),
                  int(tail_count) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
-        rewind_ids += tail_ids
+        # Cloned AND represented tail originals are superseded duplicates (same class as #86366).
+        rewind_ids += tail_ids + represented_ids
         rewind_ids = list(dict.fromkeys(rewind_ids))
         if rewind_ids:
             placeholders = _placeholders(rewind_ids)

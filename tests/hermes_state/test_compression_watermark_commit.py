@@ -10,6 +10,7 @@ lease was reclaimed cannot publish a stale compaction.
 
 from __future__ import annotations
 
+import copy
 import json
 import sqlite3
 import threading
@@ -34,10 +35,23 @@ def _seed(db: SessionDB, n: int = 6) -> None:
         db.append_message("sess1", role=role, content=f"turn {i}")
 
 
-SUMMARY = [
+_SUMMARY_BASELINE = [
     {"role": "user", "content": "[CONTEXT COMPACTION] summary of turns 0-5"},
     {"role": "assistant", "content": "Continuing from the summary."},
 ]
+SUMMARY = copy.deepcopy(_SUMMARY_BASELINE)
+
+
+@pytest.fixture(autouse=True)
+def _reset_summary_fixture():
+    """archive_and_compact mutates handoff dicts in place (stamps ``timestamp``
+    onto each), and SUMMARY is shared by reference across every test in this
+    file. Without resetting it, an earlier test's commit permanently taints
+    SUMMARY's identity for every later test (see carried-patch-reports skill:
+    'A shared mutable module-level test fixture poisons LATER tests'). Reset
+    to a pristine deep copy before each test runs."""
+    SUMMARY[:] = copy.deepcopy(_SUMMARY_BASELINE)
+    yield
 
 
 class TestWatermarkCommit:
@@ -59,6 +73,86 @@ class TestWatermarkCommit:
             "mid-compression reply",
         ], "tail must follow the summary, in arrival order"
         assert count == 4
+
+    def test_tail_already_in_compacted_handoff_is_not_cloned_twice(
+        self, db: SessionDB
+    ) -> None:
+        _seed(db)
+        watermark = db.get_active_message_watermark("sess1")
+        db.append_message("sess1", role="user", content="mid-compression steer")
+        late_arrival = db.get_messages_as_conversation("sess1")[-1]
+        assert late_arrival.get("_db_persisted") is True
+        compacted = [*SUMMARY, late_arrival]
+
+        count = db.archive_and_compact("sess1", compacted, watermark=watermark)
+
+        contents = [row["content"] for row in db.get_messages("sess1")]
+        assert contents == [
+            "[CONTEXT COMPACTION] summary of turns 0-5",
+            "Continuing from the summary.",
+            "mid-compression steer",
+        ]
+        assert count == 3
+
+    def test_generated_handoff_replaces_same_concurrent_scaffold(
+        self, db: SessionDB
+    ) -> None:
+        _seed(db)
+        watermark = db.get_active_message_watermark("sess1")
+        db.append_message(
+            "sess1",
+            role="user",
+            content=SUMMARY[0]["content"],
+        )
+
+        count = db.archive_and_compact("sess1", SUMMARY, watermark=watermark)
+
+        contents = [row["content"] for row in db.get_messages("sess1")]
+        assert contents.count(SUMMARY[0]["content"]) == 1
+        assert count == 2
+
+    def test_overlap_match_is_per_occurrence_and_keeps_tail_order(
+        self, db: SessionDB
+    ) -> None:
+        """One handoff copy retires ONE durable twin (the oldest); the rest of the
+        concurrent tail is still cloned after the handoff in arrival order, and the
+        retired originals are superseded duplicates (rewind flags, recalled once)."""
+        _seed(db)
+        watermark = db.get_active_message_watermark("sess1")
+        db.append_message("sess1", role="user", content="steer zqxonce")
+        db.append_message("sess1", role="assistant", content="ack zqxonce")
+        db.append_message("sess1", role="user", content="steer zqxonce")
+        db.append_message("sess1", role="assistant", content="after the twin")
+        first_ack = db.get_messages_as_conversation("sess1")[-3]
+        assert first_ack["content"] == "ack zqxonce" and first_ack.get("timestamp")
+        # Generated (untimed) copy of the steer + the durable (timed) ack row.
+        compacted = [*SUMMARY, {"role": "user", "content": "steer zqxonce"}, first_ack]
+
+        count = db.archive_and_compact("sess1", compacted, watermark=watermark)
+
+        contents = [row["content"] for row in db.get_messages("sess1")]
+        assert contents == [
+            SUMMARY[0]["content"],
+            SUMMARY[1]["content"],
+            "steer zqxonce",
+            "ack zqxonce",
+            "steer zqxonce",
+            "after the twin",
+        ]
+        assert count == 6
+        everything = db.get_messages("sess1", include_inactive=True)
+        retired = [
+            r for r in everything
+            if r["content"] in {"steer zqxonce", "ack zqxonce"} and not r["active"]
+        ]
+        assert sorted(r["content"] for r in retired) == [
+            "ack zqxonce", "steer zqxonce", "steer zqxonce",
+        ]
+        assert all(r["compacted"] == 0 for r in retired), (
+            "represented / cloned originals are superseded duplicates, not compacted history"
+        )
+        hits = [r for r in db.search_messages("zqxonce") if r.get("session_id") == "sess1"]
+        assert len(hits) == 3, "recall must see each live message once"
 
     def test_tail_clone_preserves_every_column(self, db: SessionDB) -> None:
         """The pure-SQL clone must carry sidecar fields byte-exact."""
