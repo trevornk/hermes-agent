@@ -868,7 +868,7 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
         settle("resolved")
 
 
-def _status_update(sid: str, kind: str, text: str | None = None):
+def _status_update(sid: str, kind: str, text: str | None = None, *, category: str | None = None):
     if not (body := (text if text is not None else kind).strip()):
         return
     out_kind = kind if text is not None else "status"
@@ -879,7 +879,12 @@ def _status_update(sid: str, kind: str, text: str | None = None):
         from agent.conversation_compression import is_compaction_progress_status
         if is_compaction_progress_status(body):
             out_kind = "compacting"
-    _emit("status.update", sid, {"kind": out_kind, "text": body})
+    payload = {"kind": out_kind, "text": body}
+    # Typed identity of a legacy-kind status (context pressure rides on ``warn``); additive so
+    # drivers without a renderer for it see the unchanged legacy payload.
+    if category:
+        payload["category"] = category
+    _emit("status.update", sid, payload)
 
 
 def _image_meta(path: Path) -> dict:

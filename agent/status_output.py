@@ -13,6 +13,14 @@ from agent.session_activity import ActivityProvenance
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
 
+# Typed identity of the blocked-compression warning. It rides on the legacy ``warn`` status kind
+# (every existing consumer keeps its behaviour) and is handed only to ``status_callback``
+# consumers that accept ``category=``; the TUI gateway forwards it so a renderer can key the
+# alert without sniffing text. Recovery is a typed-only edge: legacy consumers (chat gateways
+# that post status text) never see it, exactly as before.
+CONTEXT_PRESSURE_STATUS_CATEGORY = "context_pressure"
+CONTEXT_PRESSURE_RECOVERED_STATUS_KIND = "context_pressure_recovered"
+
 
 class StatusOutputMixin:
     """Status/warning/notice emission and retry-chatter buffering (see module docstring)."""
@@ -71,7 +79,31 @@ class StatusOutputMixin:
             except Exception:
                 logger.debug("%s error in %s", name, origin, exc_info=True)
 
-    def _emit_status_kind(self, kind: str, message: str, *, origin: str) -> None:
+    def _call_status_callback(
+        self, kind: str, message: str, *, origin: str, category: str | None = None, typed_only: bool = False,
+    ) -> None:
+        """``status_callback(kind, message[, category=...])``. ``category`` goes only to consumers whose
+        signature accepts it (legacy two-argument consumers are called exactly as before); ``typed_only``
+        drops the event for those legacy consumers. Never raises."""
+        cb = getattr(self, "status_callback", None)
+        if not cb:
+            return
+        typed = False
+        if category is not None:
+            from agent.context_compressor_summary import _accepts_keyword_argument
+
+            typed = _accepts_keyword_argument(cb, "category")
+        if typed_only and not typed:
+            return
+        try:
+            if typed:
+                cb(kind, message, category=category)
+            else:
+                cb(kind, message)
+        except Exception:
+            logger.debug("status_callback error in %s", origin, exc_info=True)
+
+    def _emit_status_kind(self, kind: str, message: str, *, origin: str, category: str | None = None) -> None:
         """Print to the CLI (``_vprint(force=True)``) and forward to ``status_callback(kind, message)``. Never raises."""
         from gateway.warning_notifications import is_warning_status
         try:
@@ -79,7 +111,7 @@ class StatusOutputMixin:
                 self._vprint(f"{self.log_prefix}{message}", force=True)
         except Exception:
             pass
-        self._call_callback("status_callback", kind, message, origin=origin)
+        self._call_status_callback(kind, message, origin=origin, category=category)
 
     def _warning_presentation_enabled(self) -> bool:
         from gateway.warning_notifications import warning_notifications_enabled
@@ -101,9 +133,9 @@ class StatusOutputMixin:
         """Emit a lifecycle status message (CLI + gateway ``status_callback``)."""
         self._emit_status_kind("lifecycle", message, origin="_emit_status")
 
-    def _emit_warning(self, message: str) -> None:
+    def _emit_warning(self, message: str, *, category: str | None = None) -> None:
         """Emit a user-visible warning for degraded side paths where the turn continues but the user must know."""
-        self._emit_status_kind("warn", message, origin="_emit_warning")
+        self._emit_status_kind("warn", message, origin="_emit_warning", category=category)
 
     def _emit_startup_warning(self, message: str) -> None:
         """A warning raised during ``__init__`` that the user must see (e.g. a memory provider that
