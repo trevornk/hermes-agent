@@ -228,6 +228,14 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        # A persisted session origin is routing-only. Synthetic completion events reuse that
+        # source, so its old message_id must never become a reply anchor for this turn or for
+        # background work spawned from it. The inbound event is the sole per-turn provenance.
+        # LOCAL routes are exempt: the local adapter authorizes a source by object identity
+        # (gateway/session_local.py ``authorize_source``) and the turn's frozen policy (model,
+        # cwd) hangs off that check, while LOCAL message ids are never reply anchors.
+        if source.platform is not Platform.LOCAL:
+            source = dataclasses.replace(source, message_id=event.message_id)
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
