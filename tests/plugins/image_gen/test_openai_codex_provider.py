@@ -58,7 +58,7 @@ def codex_backend(monkeypatch):
     # Seed the auth.json token below the credential/base resolver so generate() exercises the real
     # (token, base_url) binding; no pool present.
     from agent import auxiliary_client
-    monkeypatch.setattr(auxiliary_client, "_select_pool_entry", lambda provider: (False, None))
+    monkeypatch.setattr(auxiliary_client, "_select_pool_entry", lambda provider, model=None: (False, None))
     monkeypatch.setattr(auxiliary_client, "_read_codex_singleton_token", lambda: "codex-token")
     state = {"requests": [], "respond": None}
 
@@ -89,6 +89,31 @@ class TestMetadata:
 
 
 
+    def test_list_models_covers_both_generations(self, provider):
+        ids = [m["id"] for m in provider.list_models()]
+        # gpt-image-2 quality tiers stay, and the 2.5 variants are reachable through Codex OAuth
+        # too: the native images endpoint takes the image model as a request field.
+        assert {"gpt-image-2-low", "gpt-image-2-medium", "gpt-image-2-high"} <= set(ids)
+        assert {"gpt-image-2.5-flare", "gpt-image-2.5-sunburst"} <= set(ids)
+
+    def test_codex_catalog_matches_api_key_plugin(self, provider):
+        """Both OpenAI backends expose the same image models — only the auth path differs."""
+        from plugins.image_gen.openai import MODELS as api_key_models
+
+        assert set(m["id"] for m in provider.list_models()) == set(api_key_models)
+
+    def test_selected_model_reaches_the_native_endpoint(self, provider):
+        """Regression: the request body pinned ``gpt-image-2``, so a 2.5 selection was silently
+        ignored — the backend would have generated with the wrong model."""
+        for tier, expected in (
+            ("gpt-image-2-high", "gpt-image-2"),
+            ("gpt-image-2.5-flare", "gpt-image-2.5-flare"),
+            ("gpt-image-2.5-sunburst-max", "gpt-image-2.5-sunburst"),
+        ):
+            meta = provider.models[tier]
+            _, body = codex_plugin._build_image_request(
+                prompt="x", size="1024x1024", quality=meta["quality"], api_model=meta["api_model"])
+            assert body["model"] == expected
 
     def test_setup_schema_has_no_required_env_vars(self, provider):
         """#102144: the keyless row must declare the shared Codex OAuth bootstrap hook (otherwise setup
@@ -186,7 +211,7 @@ class TestGenerate:
 
     def test_returns_auth_error_without_codex_token(self, provider, monkeypatch):
         from agent import auxiliary_client
-        monkeypatch.setattr(auxiliary_client, "_select_pool_entry", lambda provider: (False, None))
+        monkeypatch.setattr(auxiliary_client, "_select_pool_entry", lambda provider, model=None: (False, None))
         monkeypatch.setattr(auxiliary_client, "_read_codex_singleton_token", lambda: None)
         result = provider.generate("a cat")
         assert result["success"] is False
@@ -266,6 +291,18 @@ class TestGenerate:
         body = json.loads(codex_backend["requests"][0].content)
         assert body["images"] == [{"image_url": "data:image/png;base64," + _b64_png()}]
 
+
+    def test_generate_with_25_model_posts_25_api_model(self, provider, codex_backend, monkeypatch):
+        """End-to-end: selecting a 2.5 tier must reach the wire as that api_model, not gpt-image-2."""
+        monkeypatch.setenv("OPENAI_IMAGE_MODEL", "gpt-image-2.5-sunburst")
+
+        result = provider.generate("a cat")
+
+        assert result["success"] is True
+        assert result["model"] == "gpt-image-2.5-sunburst"
+        (request,) = codex_backend["requests"]
+        body = json.loads(request.content)
+        assert body["model"] == "gpt-image-2.5-sunburst"
 
     def test_rejects_non_image_local_source(self, provider, codex_backend, tmp_path):
         text_path = tmp_path / "not-image.txt"
