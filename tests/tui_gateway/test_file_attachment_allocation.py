@@ -152,3 +152,13 @@ def test_upload_never_writes_through_a_planted_symlink(sessions, tmp_path):
     assert not outside.exists()
     assert stored.parent == root.resolve() and stored.name == "notes-2.txt"
     assert stored.read_bytes() == b"user upload"
+
+
+@pytest.mark.parametrize("raw, staged", [
+    ("Screenshot 2026-10-09 at 11.37.03\u202fAM.png", "Screenshot 2026-10-09 at 11.37.03 AM.png"),
+    ("a\u00a0b.png", "a b.png"),
+    ("tab\tname.png", "tab_name.png"),
+])
+def test_attachment_names_stage_with_ascii_spaces(raw, staged):
+    assert server._sanitize_attachment_name(raw) == staged
+

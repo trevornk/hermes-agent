@@ -6,6 +6,7 @@ the model.
 """
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
@@ -306,3 +307,28 @@ def normalize_search_pagination(offset: Any = DEFAULT_SEARCH_OFFSET,
                                 limit: Any = DEFAULT_SEARCH_LIMIT) -> tuple[int, int]:
     """Return safe search pagination bounds for shell head/tail pipelines."""
     return max(0, _coerce_int(offset, DEFAULT_SEARCH_OFFSET)), max(1, _coerce_int(limit, DEFAULT_SEARCH_LIMIT))
+
+
+# Confusable characters seen in real filenames, collapsed after NFC.
+_FILENAME_CONFUSABLES = (
+    ("\u202f", " "),  # narrow no-break space (macOS screenshots)
+    ("\u00a0", " "),  # no-break space
+    ("\u2019", "'"),  # right single quotation mark (Finder)
+    ("\u2018", "'"),  # left single quotation mark
+)
+
+
+def canonical_filename(name: str) -> str:
+    """NFC + confusable spaces/quotes folded: two names that render identically compare equal."""
+    out = unicodedata.normalize("NFC", name)
+    for src, dst in _FILENAME_CONFUSABLES:
+        out = out.replace(src, dst)
+    return out
+
+
+def unicode_variant_entry(filename: str, entries) -> Optional[str]:
+    """The one entry in *entries* unicode-equivalent to (but not spelled as) *filename*; ``None``
+    on zero or several matches -- several = homoglyph collision, guessing would pick wrongly."""
+    target = canonical_filename(filename)
+    hits = [e for e in entries if e and e != filename and canonical_filename(e) == target]
+    return hits[0] if len(hits) == 1 else None
