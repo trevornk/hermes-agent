@@ -942,6 +942,87 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
     assert child_dir.exists(), "Non-scratch 'dir' child workspace is never deleted"
 
 
+def _scratch_chain(conn, *titles):
+    """Create a linear parent->child chain of scratch tasks with resolved
+    workspace dirs; return ``[(task_id, workspace_path), ...]`` root first."""
+    chain = []
+    for title in titles:
+        tid = kb.create_task(conn, title=title)
+        ws = kbw.resolve_workspace(kb.get_task(conn, tid))
+        kbw.set_workspace_path(conn, tid, ws)
+        if chain:
+            kb.link_tasks(conn, chain[-1][0], tid)
+        chain.append((tid, ws))
+    return chain
+
+
+def test_deferred_middle_completion_sweeps_finished_parent(kanban_home):
+    """A(done) -> B -> C(active): completing B defers B's own cleanup (C still
+    needs it) but must still sweep A, whose only child is now terminal.
+
+    Regression: the active-children early return skipped the parent sweep, so
+    A's scratch dir leaked forever.
+    """
+    with kbc.connect() as conn:
+        (a, a_ws), (b, b_ws), (_c, c_ws) = _scratch_chain(conn, "A", "B", "C")
+        kb.complete_task(conn, a, result="handoff")
+        assert a_ws.exists(), "deferred while B active"
+
+        assert kb.complete_task(conn, b, result="handoff")
+
+        assert not a_ws.exists(), "A has no active children once B is done"
+        assert b_ws.exists(), "B stays while C can still read it"
+        assert c_ws.exists()
+
+
+def test_parent_sweep_recurses_through_terminal_ancestors(kanban_home):
+    """When a deferred middle task is finally swept, its already-terminal
+    ancestors must be revisited too, not just the immediate parent.
+
+    A and B reached a terminal status while still deferred (e.g. state left by
+    an older build without the deferred-path sweep). Completing C must sweep B
+    and then A.
+    """
+    with kbc.connect() as conn:
+        (a, a_ws), (b, b_ws), (c, c_ws) = _scratch_chain(conn, "A", "B", "C")
+        conn.execute(
+            "UPDATE tasks SET status = 'done' WHERE id IN (?, ?)", (a, b),
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (c,))
+        conn.commit()
+        assert a_ws.exists() and b_ws.exists()
+
+        assert kb.complete_task(conn, c, result="built")
+
+        assert not c_ws.exists()
+        assert not b_ws.exists(), "B's last child finished"
+        assert not a_ws.exists(), "grandparent A must be revisited"
+
+
+def test_parent_sweep_recursion_stops_at_ancestor_with_active_child(kanban_home):
+    """Recursion only climbs through terminal ancestors with no active
+    children: A(done) has a second, still-active child D, so sweeping B after
+    C completes must leave A (D may still read it) and D alone."""
+    with kbc.connect() as conn:
+        (a, a_ws), (b, b_ws), (c, c_ws) = _scratch_chain(conn, "A", "B", "C")
+        d = kb.create_task(conn, title="D")
+        d_ws = kbw.resolve_workspace(kb.get_task(conn, d))
+        kbw.set_workspace_path(conn, d, d_ws)
+        kb.link_tasks(conn, a, d)
+        conn.execute(
+            "UPDATE tasks SET status = 'done' WHERE id IN (?, ?)", (a, b),
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (c,))
+        conn.commit()
+
+        assert kb.complete_task(conn, c, result="built")
+
+        assert not c_ws.exists()
+        assert not b_ws.exists()
+        assert a_ws.exists(), "A still has active child D"
+        assert d_ws.exists()
+
+
 
 
 def test_is_managed_scratch_path_rejects_kanban_metadata_subtrees(kanban_home):
