@@ -89,6 +89,50 @@ def test_a_finite_run_creates_mains_oneshot_session_so_bare_c_finds_it(store, mo
     assert client.calls[-1][1]["source"] == "cli"
 
 
+def test_an_inherited_worker_source_the_owner_cannot_create_falls_back_to_this_runs_own(store, monkeypatch):
+    """A kanban/cron worker shell exports HERMES_SESSION_SOURCE=kanban; a nested `hermes chat -q`
+    inherits it, but ``session.create`` only takes the advertised surfaces, so sending ``kanban``
+    failed the run with ``invalid_params`` before the model connection opened."""
+    db, client = store
+    surfaces = ["acp", "cli", "gui", "oneshot", "tool", "tui"]
+    rpc = client.rpc
+
+    async def describing(method, *, _timeout=None, **params):
+        if method == "runtime.describe":
+            client.calls.append((method, params))
+            return {"session_create": {"sources": surfaces, "parameters": []}}
+        return await rpc(method, _timeout=_timeout, **params)
+    client.rpc = describing
+    monkeypatch.delenv("HERMES_SESSION_SOURCE_EXPLICIT", raising=False)
+    for inherited in ("kanban", "cron"):
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", inherited)
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+        GatewaySessionStore(db.connection).open_session(cli(), {})
+        assert client.calls[-1][0] == "session.create"
+        assert client.calls[-1][1]["source"] == "oneshot"
+        monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION")
+        GatewaySessionStore(db.connection).open_session(cli(), {})
+        assert client.calls[-1][1]["source"] == "cli"
+    # A creatable inherited label (an integration's ``tool``) is still kept...
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "tool")
+    GatewaySessionStore(db.connection).open_session(cli(), {})
+    assert client.calls[-1][1]["source"] == "tool"
+    # ...and an explicit --source is never rewritten: its refusal is the flag's to report.
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    monkeypatch.setenv("HERMES_SESSION_SOURCE_EXPLICIT", "1")
+    GatewaySessionStore(db.connection).open_session(cli(), {})
+    assert client.calls[-1][1]["source"] == "kanban"
+
+
+def test_an_owner_that_advertises_no_sources_is_judged_by_this_installs_surfaces(store, monkeypatch):
+    db, client = store  # FakeClient's runtime.describe carries no session_create contract
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    monkeypatch.delenv("HERMES_SESSION_SOURCE_EXPLICIT", raising=False)
+    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+    db.open_session(cli(), {})
+    assert client.calls[-1][1]["source"] == "cli"
+
+
 def test_resume_attaches_and_unknown_target_is_left_to_mains_not_found_path(store):
     db, client = store
     assert db.open_session(cli("local-old", resumed=True)) == "local-old"
