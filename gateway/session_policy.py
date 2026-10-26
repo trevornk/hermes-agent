@@ -663,6 +663,13 @@ def _resolve_toolsets(params, config, source, safe_mode, coding_posture=False, b
         effective = {t for name in enabled for t in resolve_toolset(name)}
         if not requested <= effective:
             _refuse('toolsets', f"not available on this surface: {', '.join(sorted(requested - effective))}")
+        # An explicit pick is the session's exact allowlist, as `hermes chat -t` is without a gateway.
+        # _get_platform_tools also applies saved-profile augmentations the pick never named: the active
+        # context engine's runtime tools (lcm_*), every enabled MCP server when none is listed, and
+        # default-on plugin toolsets. A `-t web,vision` worker must not inherit them.
+        named = set(explicit) | {name[4:] for name in explicit if name.startswith('mcp-')}
+        enabled = {key for key in enabled
+                   if key in named or ((tools := set(resolve_toolset(key))) and tools <= requested)}
     if explicit is None and source in {'tui', 'gui'}:
         # Same surface toolsets as the native TUI factory, without its env inference.
         # The fold-in lands after _get_platform_tools subtracted agent.disabled_toolsets, so
