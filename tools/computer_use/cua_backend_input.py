@@ -101,7 +101,20 @@ class _InputMixin:
         button_norm = (button or "left").lower()
         if button_norm not in {"left", "right", "middle"}:
             return _refuse("click", f"unknown button {button!r} — expected left, right, middle.")
+        if click_count not in (1, 2):
+            return _refuse("click", "click_count must be 1 or 2.")
         tool, args["button"] = ("double_click" if click_count == 2 else "click"), button_norm
+        if click_count == 2 and element is None and self._session.supports_input_property("click", "count"):
+            # count applies ONLY to pixels. Unlike double_click's screen coordinates,
+            # click preserves the screenshot/window-local coordinate contract.
+            tool, args["count"] = "click", 2
+        if tool == "double_click" and self._session.capabilities_discovered:
+            if not self._session.supports_input_property(tool, "button"):
+                if button_norm != "left":
+                    return _refuse(tool, "This driver's double_click cannot preserve the requested button.")
+                args.pop("button")
+            if modifiers and not self._session.supports_input_property(tool, "modifier"):
+                return _refuse(tool, "This driver's double_click cannot preserve modifiers.")
         refusal = self._pointer_args(tool, args, (
             ("element_index click", {"element_index": element} if element is not None else None),
             ("coordinate click", {"x": x, "y": y} if x is not None and y is not None else None),
@@ -115,6 +128,21 @@ class _InputMixin:
              button: str = "left", modifiers: Optional[list[str]] = None,
              delivery_mode: Optional[str] = None, bring_to_front: bool = False) -> ActionResult:
         refusal, args = self._target_args("drag")
+        if refusal is None and from_element is not None and to_element is not None:
+            if not all(self._session.supports_input_property("drag", key) for key in ("from_element", "to_element")):
+                return _refuse("drag", "The live driver does not support element-addressed drag; capture and use pixels.")
+        if refusal is None:
+            button_norm = (button or "left").lower()
+            if button_norm not in {"left", "right", "middle"}:
+                return _refuse("drag", f"unknown button {button!r}.")
+            if button_norm != "left":
+                if not self._session.supports_input_property("drag", "button"):
+                    return _refuse("drag", "The live driver cannot preserve the requested drag button.")
+                args["button"] = button_norm
+            if modifiers:
+                if not self._session.supports_input_property("drag", "modifier"):
+                    return _refuse("drag", "The live driver cannot preserve drag modifiers.")
+                args["modifier"] = modifiers
         if refusal is None:
             refusal = self._pointer_args("drag", args, (
                 ("element-based drag", {"from_element": from_element, "to_element": to_element}
@@ -132,16 +160,21 @@ class _InputMixin:
         if refusal is not None:
             return refusal
         args.update(direction=direction, amount=max(1, min(50, amount)))
-        # An element without a known window_id is not an addressing form here; scrolling then falls through
-        # to the coordinate form or the bare window. Some driver schemas reject x/y on scroll: only send
-        # coordinates when the driver advertises support; otherwise it scrolls the targeted window
-        # (window_id is still sent for routing).
-        xy = lambda: ({"x": x, "y": y}
-                      if self._session.supports_capability("input.scroll.coordinates", tool="scroll") else {})
+        if modifiers:
+            if not self._session.supports_input_property("scroll", "modifier"):
+                return _refuse("scroll", "The live driver cannot preserve scroll modifiers.")
+            args["modifier"] = modifiers
+        if element is None and (x is not None or y is not None):
+            if x is None or y is None:
+                return _refuse("scroll", "Coordinate scroll requires both x and y.")
+            if not (all(self._session.supports_input_property("scroll", key) for key in ("x", "y"))
+                    or (not getattr(self._session, "_tool_schemas", {}).get("scroll")
+                        and self._session.supports_capability("input.scroll.coordinates", tool="scroll"))):
+                return _refuse("scroll", "The live driver does not support coordinate scroll; refusing window-wide fallback.")
         refusal = self._pointer_args("scroll", args, (
             ("element scroll", {"element_index": element}
-             if element is not None and self._active_window_id is not None else None),
-            ("coordinate scroll", xy if x is not None and y is not None else None),
+             if element is not None else None),
+            ("coordinate scroll", {"x": x, "y": y} if x is not None and y is not None else None),
         ), None)
         return refusal if refusal is not None else self._run_input_action("scroll", args, delivery_mode, bring_to_front)
 

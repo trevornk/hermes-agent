@@ -255,6 +255,9 @@ class _CaptureMixin:
         from tools.computer_use import cua_backend as _cb  # lazy: cua_backend imports this module at import time
         if capped := _cb._cua_configured_ax_max_elements():
             args["max_elements"] = capped
+        # New drivers default to markdown only, which loses frames and snapshot tokens.
+        if self._session.supports_input_property("get_window_state", "tree_format"):
+            args["tree_format"] = "elements"
         return args
 
     def _capture_vision(self) -> tuple[Optional[str], Optional[str], list[UIElement], str]:
