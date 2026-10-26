@@ -102,6 +102,37 @@ class TestIsBotMentioned:
     # Ported from openclaw/openclaw#64796
 
 
+    def test_mentions_field_present_but_empty_suppresses_bare_localpart(self):
+        """m.mentions field PRESENT (even empty []) is authoritative: bare localpart text
+        must NOT fall back to a match. Regression for the WINTOPPERS incident — a bridged
+        message containing the bot's bare localpart as an ordinary word (there: "neo", here
+        the fixture bot's localpart "hermes") must not false-positive on that bare word when
+        the event carries an (empty) m.mentions field."""
+        assert not self.adapter._is_bot_mentioned(
+            "i think hermes trismegistus is a cool historical figure",
+            mention_user_ids=[],
+        )
+
+    def test_mentions_field_present_naming_other_user_suppresses_bare_localpart(self):
+        """m.mentions naming someone else is authoritative even when the body separately
+        contains the bot's bare localpart as an ordinary word."""
+        assert not self.adapter._is_bot_mentioned(
+            "hermes is a cool name but I mean @alice:example.org",
+            mention_user_ids=["@alice:example.org"],
+        )
+
+    def test_mentions_field_absent_still_falls_back_to_bare_localpart(self):
+        """No m.mentions key at all (legacy/bridged event) — bare localpart fallback still
+        applies. mention_user_ids=None is the sentinel for "field absent"."""
+        assert self.adapter._is_bot_mentioned("hermes can you help?", mention_user_ids=None)
+
+    def test_mentions_field_present_full_mxid_text_match_still_works(self):
+        """Explicit full-MXID text match stays authoritative even when m.mentions is present
+        and doesn't name the bot (the sender typed the ID by hand)."""
+        assert self.adapter._is_bot_mentioned(
+            "hey @hermes:example.org help", mention_user_ids=[]
+        )
+
 
 class TestStripMention:
     def setup_method(self):
@@ -203,6 +234,29 @@ async def test_require_mention_m_mentions_other_user_ignored(monkeypatch):
     event = _make_event(
         "hey alice check this",
         mention_user_ids=["@alice:example.org"],
+    )
+
+    await adapter._on_room_message(event)
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_require_mention_bare_localpart_ignored_when_mentions_field_present(monkeypatch):
+    """Regression for the WINTOPPERS/mautrix-signal incident: a bridged event that carries an
+    (empty) m.mentions field must not activate the bot merely because the body contains the
+    bot's bare localpart as an ordinary word (there: Matt's message contained the bot's
+    localpart "neo" incidentally, e.g. "i bet the neo is better than my intel"; the fixture
+    bot here has localpart "hermes", so the analogous case is a body that happens to contain
+    "hermes" as plain text). Before the fix, _is_bot_mentioned fell back to bare-localpart
+    text matching regardless of m.mentions, so this message was wrongly treated as a mention."""
+    monkeypatch.delenv("MATRIX_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("MATRIX_FREE_RESPONSE_ROOMS", raising=False)
+    monkeypatch.setenv("MATRIX_AUTO_THREAD", "false")
+
+    adapter = _make_adapter()
+    event = _make_event(
+        "i think hermes trismegistus is a cool historical figure",
+        mention_user_ids=[],  # m.mentions field present, but empty — authoritative
     )
 
     await adapter._on_room_message(event)
