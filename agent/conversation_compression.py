@@ -3016,29 +3016,38 @@ def _fold_todo_snapshot(agent: Any, compressed: list) -> None:
     _todo_store_is_authoritative = False
     with contextlib.suppress(Exception):
         _todo_store_is_authoritative = bool(_todo_has_items()) if callable(_todo_has_items) else False
-    if _todo_store_is_authoritative:
-        for _todo_idx in range(len(compressed) - 1, -1, -1):
+    # Strip EVERY stale block, newest first — not only the newest one. A standalone snapshot gets
+    # buried behind assistant/tool rows when another compression fires in the same turn, and a
+    # resumed transcript carries its snapshot rows flag-less; refreshing only the newest then stacks
+    # one snapshot per boundary. A fresh snapshot about to be injected retires the old ones too, so
+    # exactly one survives at the newest safe boundary. Real user text that carried a merged block
+    # is kept; a row whose only content was the snapshot is scaffolding whether or not its synthetic
+    # flag survived persistence, and is dropped rather than left behind as an empty user turn.
+    if _todo_store_is_authoritative or todo_snapshot:
+        _todo_idx = len(compressed) - 1
+        while _todo_idx >= 0:
             _todo_message = compressed[_todo_idx]
-            if not isinstance(_todo_message, dict) or _todo_message.get("role") != "user":
-                continue
-            _todo_content = _todo_message.get("content")
+            _todo_content = _todo_message.get("content") if isinstance(_todo_message, dict) else None
             _todo_stripped = _strip_stale_todo_snapshot(_todo_content)
-            if _todo_stripped == _todo_content:
-                continue
-            if _todo_message.get("_todo_snapshot_synthetic") and _todo_snapshot_is_only_content(
-                _todo_content, _todo_stripped
+            if (
+                not isinstance(_todo_message, dict) or _todo_message.get("role") != "user"
+                or _todo_stripped == _todo_content
             ):
-                compressed.pop(_todo_idx)
-                if _todo_idx < len(compressed):
+                _todo_idx -= 1
+                continue
+            if _todo_snapshot_is_only_content(_todo_content, _todo_stripped):
+                del compressed[_todo_idx]
+                if _todo_idx < len(compressed) and agent._repair_message_sequence(compressed):
                     # A standalone snapshot can drift from the tail; deleting it may expose two
                     # assistant rows, so use the normal replay repair to keep metadata consistent.
-                    agent._repair_message_sequence(compressed)
+                    # Repair rewrites the list in place: rescan from the tail (a no-op on clean rows).
+                    _todo_idx = len(compressed)
             else:
                 _replace_message_content(_todo_message, _todo_stripped)
                 # No longer todo-only scaffolding; other synthetic flags stay authoritative and
                 # _is_real_user_message() recomputes provenance from content + flags.
                 _todo_message.pop("_todo_snapshot_synthetic", None)
-            break
+            _todo_idx -= 1
     if todo_snapshot:
         # If this boundary pruned skill bodies, the policy behind the todos is gone:
         # add a reload notice after TODO_INJECTION_HEADER so both strip together.
