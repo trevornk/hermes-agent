@@ -126,8 +126,10 @@ class TestCompressionBoundaryHook:
             with patch.object(
                 db, "publish_compression_child", side_effect=_record_publish
             ):
+                # Enough source rows that the one-row summary is a real token reduction: the
+                # carried retry_recovery contract rejects a non-reducing external-engine result.
                 agent._compress_context(
-                    [{"role": "user", "content": "request"}],
+                    [{"role": "user", "content": f"request {i}"} for i in range(10)],
                     "sys",
                     approx_tokens=100,
                 )
