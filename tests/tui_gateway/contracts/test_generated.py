@@ -61,6 +61,8 @@ def emitted_event_names() -> set[str]:
         names.update(_LITERAL_EMIT.findall(text))
         names.update(_LITERAL_FRAME.findall(text))
         names.update(_SIDE_AGENT.findall(text))
+    # [carried, desktop_owner_completion] the Desktop-owner recovery lane emits through the server.
+    names.update(_LITERAL_EMIT.findall(_read(REPO / "cron" / "desktop_origin.py")))
     from tui_gateway.agent_callbacks import _CHILD_DELTA_EVENTS
     from tui_gateway.change_watcher import _CHANGE_WATCHES
 

@@ -199,22 +199,24 @@ def _prune_durable_records() -> None:
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?", (cutoff,))
+            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ? AND delegation_id NOT LIKE 'cron-owner-%'", (cutoff,))
+        from cron.desktop_origin import compact_completion_history
+        compact_completion_history(conn, cutoff)
         terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')").fetchone()[0]
+            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing') AND delegation_id NOT LIKE 'cron-owner-%'").fetchone()[0]
         if terminal_count > _MAX_RETAINED_COMPLETED:
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing')
+                     WHERE state NOT IN ('running','finalizing') AND delegation_id NOT LIKE 'cron-owner-%'
                      ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
                               updated_at ASC LIMIT ?
                    )""", (terminal_count - _MAX_RETAINED_COMPLETED,))
         pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'""").fetchone()[0]
+               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending' AND delegation_id NOT LIKE 'cron-owner-%'""").fetchone()[0]
         if pending_count > _MAX_DURABLE_PENDING:
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending' AND delegation_id NOT LIKE 'cron-owner-%'
                      ORDER BY updated_at ASC LIMIT ?
                    )""", (pending_count - _MAX_DURABLE_PENDING,))
 
@@ -368,8 +370,9 @@ def _replay_pending(conn, rows, target_queue, now: float, *, startup: bool = Fal
     the orphan sweep skips the row until the copy is handed back (``return_completion_offer``)."""
     home, restored = hermes_home_key(get_hermes_home()), 0
     for delegation_id, payload, completed_at, dispatched_at in rows:
+        evt = json.loads(payload)
         age_basis = completed_at or dispatched_at
-        if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
+        if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S and not (isinstance(evt, dict) and evt.get('cron_origin')):
             conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
                           delivery_claim=NULL, delivery_claimed_at=NULL,
                           updated_at=?
@@ -383,7 +386,6 @@ def _replay_pending(conn, rows, target_queue, now: float, *, startup: bool = Fal
                 # The owner's explicit startup replay and the first-consume replay
                 # (process_registry.restore_completions) may both run: offer once.
                 continue
-        evt = json.loads(payload)
         if isinstance(evt, dict):
             evt = redact_completion_event(evt)
         with _orphan_lock:

@@ -833,6 +833,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   const showChallenge = createFreeTierChallengePresenter(sys, openExternalUrl)
   const showBillingVerification = createBillingVerificationPresenter(sys, openExternalUrl)
 
+  // Cron completion notice ids already appended to the transcript this session,
+  // so a re-emit (e.g. after a reconnect) never duplicates the same durable row.
+  const projectedCronCompletions = new Set<string>()
+
   // When a clarify prompt is dismissed without an answer (the backend request
   // timed out and returned no answer), the live ClarifyPrompt overlay is
   // left set until the next turn's idle() silently nulls it — so the question
@@ -1650,6 +1654,20 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         openCanonicalApproval(ev, setStatus, ringPromptBell)
 
         return
+      case 'cron.completion': {
+        // Completion rows are durable on the backend, but this projection makes
+        // them visible immediately. It deliberately bypasses turnController:
+        // a cron job is not an agent turn and must not reset active streaming.
+        const id = String(ev.payload?.id ?? '').trim()
+        const text = String(ev.payload?.text ?? '').trim()
+
+        if (id && text && !projectedCronCompletions.has(id)) {
+          projectedCronCompletions.add(id)
+          appendMessage({ role: 'system', text })
+        }
+
+        return
+      }
 
       case 'background.complete':
         if (!ev.payload) {

@@ -1,5 +1,6 @@
 """Imported turns retain their receipt and cannot bypass the local FIFO."""
 import contextlib
+import logging
 import threading
 from types import SimpleNamespace
 
@@ -82,17 +83,25 @@ def test_viewer_poller_never_discovers_or_claims_bot_execution(monkeypatch, tmp_
     events.put({'type': 'owned-completion'})
     monkeypatch.setattr(process_registry, 'completion_queue', events)
     delivered = []
+    # [carried, desktop_owner_completion] the loop also runs the Desktop-owner recovery lane; stub
+    # it so the assertion below covers that lane without claiming any execution.
+    from cron import desktop_origin
+    recovered = []
+    monkeypatch.setattr(desktop_origin, 'recover_interrupted', lambda server, session, sid: recovered.append(sid))
+    monkeypatch.setattr(desktop_origin, 'pending_for_session', lambda server, session: [])
     poll = rebind(session_notifications._notification_poller_scoped_loop, {
-        'time': time, '_LOOP_POLL_SECONDS': 0, '_KANBAN_POLL_SECONDS': 0,
+        'time': time, '_LOOP_POLL_SECONDS': 0, '_KANBAN_POLL_SECONDS': 0, '_BOT_COMPLETION_POLL_SECONDS': 0,
+        'logger': logging.getLogger('test'),
         '_poll_bot_live_delivery_once': lambda *a: calls.append('legacy-claim'),
         '_maybe_fire_tui_loop_tick': lambda *a: None,
         '_maybe_fire_tui_heartbeat_tick': lambda *a: None,
         '_notif_poll_kanban': lambda *a: None,
         '_session_profile_runtime_scope': lambda session: contextlib.nullcontext(),
         '_session_home': lambda session: tmp_path,
-        '_notif_handle_ready': lambda sid, session, ready, *a, **kw: (delivered.extend(ready), stop.set()),
+        '_notif_handle_ready': lambda sid, session, ready, *a, **kw: (delivered.extend(ready), ready and stop.set()),
     })
     poll(stop, 'live', {'agent': object(), 'history_lock': threading.RLock(), 'session_key': 'chat',
                       'active_session_lease': SimpleNamespace(lease_id='lease', released=False)})
     assert delivered == [{'type': 'owned-completion'}]
     assert calls == []
+    assert recovered and set(recovered) == {'live'}
