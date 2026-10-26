@@ -61,7 +61,7 @@ from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
 from hermes_cli.plugins_registrars import _NAME_NORMALIZERS, _SCOPED_PROVIDER_REGISTRARS
 from hermes_cli.plugins_state import (
     PluginState, _locked_plugin_state, _nested_plugin_mapping, _nested_plugin_value,
-    _plugin_relative_segments, _plugin_settings_entry, save_plugin_setting,
+    _plugin_relative_segments, _plugin_settings_entry, _plugin_toolset_keys_cache_path, save_plugin_setting,
 )
 
 
@@ -1130,6 +1130,8 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # messaging gateway and a TUI in one process would otherwise clobber each other.
         self._tui_message_injector: tuple[object, Callable] | None = None
         self._context_engine = None  # Set by a plugin via register_context_engine()
+        self._context_engine_rearm: dict[str, tuple[int, float]] = {}  # plugin key -> (retries, not before)
+        self._context_engine_declared: dict[str, bool] = {}  # plugin key -> registers an engine (source marker)
         # Manager-local registries keyed by name (see the matching ``PluginContext.register_*``):
         # plugins, hooks, middleware, CLI + slash commands, prompt sections, skills (qualified name ->
         # metadata), portable MCP servers, auxiliary tasks, approval transports, Slack action handlers
@@ -1767,10 +1769,6 @@ def _join_background_discovery(timeout: float = 30.0) -> None:
     t.join(timeout=timeout)
 
 
-def _plugin_toolset_keys_cache_path() -> Path:
-    return get_hermes_home() / "cache" / "plugin_toolset_keys.json"
-
-
 def _persist_plugin_toolset_keys() -> None:
     """Persist discovered plugin toolset keys + portable MCP names (best-effort)."""
     try:
@@ -2146,8 +2144,8 @@ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
 
 
 def get_plugin_context_engine():
-    """Return the plugin-registered context engine, or None."""
-    return _ensure_plugins_discovered()._context_engine
+    """Plugin-registered context engine, or None; a failed engine-plugin load is re-armed first (loader)."""
+    return _ensure_plugins_discovered().context_engine_after_rearm()
 
 
 def get_plugin_command_handler(name: str) -> Optional[Callable]:
