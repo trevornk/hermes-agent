@@ -399,6 +399,25 @@ def _start_backend_liveness() -> None:
             _log.warning("%s failed", what, exc_info=True)
 
 
+# [carried, dashboard_ws_handshake_offload.patch] gateway.ready must not queue behind the
+# *default* asyncio executor: that pool is shared with every asyncio.to_thread() caller
+# (session message reads, profile scans, ...). A reconnect storm against a large session
+# saturated it and the ready frame stalled past the client's deadline, so every reconnect
+# failed until the pile drained (ai-server 2026-09-05). resolve_skin() is small; give it its
+# own two threads.
+_READY_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ws-ready")
+
+
+async def _resolve_ready_skin() -> dict:
+    """Resolve the gateway.ready skin payload off the event loop, on a dedicated pool.
+
+    resolve_skin() is sync I/O + CPU; pooling it lets the read loop drain the frontend's initial
+    RPC burst. Extracted so the contract can be tested by calling it, rather than by grepping
+    handle_ws for a literal spelling.
+    """
+    return await asyncio.get_running_loop().run_in_executor(_READY_EXECUTOR, server.resolve_skin)
+
+
 class _SendFailed(Exception):
     """Raised by handle_ws._reply when a reply could not be written: ends the read loop."""
 
@@ -540,8 +559,10 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         _log.info("ws accepted peer=%s", peer)
         transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer, auth_identity=auth_identity)
         authority_connection = _authority_connection(ws, transport, auth_identity, operator)
-        # resolve_skin() is sync I/O + CPU; pooled so the read loop can drain the frontend's initial RPC burst.
-        skin_payload = await asyncio.to_thread(server.resolve_skin)
+        # resolve_skin() is sync I/O + CPU; pooled on a dedicated executor so it can't queue
+        # behind other to_thread() callers, and so the read loop can drain the frontend's
+        # initial RPC burst.
+        skin_payload = await _resolve_ready_skin()
         # change_events: this backend broadcasts pet/cron/sessions.changed, so clients can demote legacy
         # polls to backstops. replay_epoch lets reconnecting clients detect a backend restart and reset
         # their per-session seq watermarks (event_replay).
