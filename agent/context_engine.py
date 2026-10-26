@@ -162,6 +162,18 @@ class ContextEngine(ABC):
         estimate (avoids re-compacting after a compressed request already fit)."""
         return False
 
+    def should_compress_request_pressure(
+        self, messages: list[dict[str, Any]], prompt_tokens: int,
+    ) -> bool:
+        """Decide whether an over-threshold pre-API request should compact.
+
+        The default preserves the token-only behavior for built-in and older
+        engines. Alternative engines may inspect ``messages`` to defer a pass
+        when all pressure is inside their protected region, while still
+        allowing their overflow-recovery path to proceed.
+        """
+        return self.should_compress(prompt_tokens)
+
     def get_automatic_compaction_status_message(
         self, *, phase: str, default_message: str, **context: Any,
     ) -> str | None:

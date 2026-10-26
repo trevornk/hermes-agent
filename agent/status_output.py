@@ -167,21 +167,52 @@ class StatusOutputMixin:
                 self._emit_notice(notice)
 
     def _warn_context_overflow_blocked(self, reason: str, preflight_tokens: int, threshold_tokens: int) -> None:
-        """Warn (deduped on the block *kind* — ``cooldown`` / ``ineffective`` — not the countdown string;
-        cleared by ``_clear_context_overflow_warn``) when context is over the threshold but compression is blocked."""
+        """Warn (deduped per episode) when context is over the threshold but compression is blocked.
+
+        Generic ``warn`` also carries unrelated sanitizer, lease and summary failures, so this one
+        is tagged ``CONTEXT_PRESSURE_STATUS_CATEGORY`` for typed consumers. Severity is part of the
+        episode identity: maintenance notices coalesce, a request at the resolved context cap
+        replaces the maintenance card exactly once, and it never downgrades until
+        ``_clear_context_overflow_warn(recovered=True)``.
+        """
         _warn_kind = (reason or "unknown").split(":", 1)[0]
-        _warn_key = ("ctx_overflow_blocked", _warn_kind)
-        if getattr(self, "_last_ctx_overflow_warn", None) == _warn_key:
+        context_length = getattr(getattr(self, "context_compressor", None), "context_length", 0)
+        _hard_risk = isinstance(context_length, int) and context_length > 0 and preflight_tokens >= context_length
+        _severity = "hard_risk" if _hard_risk else "maintenance"
+        _warn_key = ("ctx_overflow_blocked", _warn_kind, _severity)
+        _previous_key = getattr(self, "_last_ctx_overflow_warn", None)
+        # Severity is monotonic within an unrecovered episode: once the user
+        # has seen cap risk, a lower subsequent estimate cannot downgrade it
+        # into another maintenance alert.
+        if (
+            isinstance(_previous_key, tuple)
+            and _previous_key[:2] == _warn_key[:2]
+            and len(_previous_key) >= 3
+            and _previous_key[2] == "hard_risk"
+            and _severity == "maintenance"
+        ):
+            return
+        if _previous_key == _warn_key:
             return
         self._last_ctx_overflow_warn = _warn_key
-        from agent.conversation_compression import CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE
+        from agent.conversation_compression import (
+            CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
+            CONTEXT_OVERFLOW_HARD_RISK_WARNING_TEMPLATE,
+        )
 
         # cooldown + anti-thrash (ineffective) are both "compression blocked".
         if _warn_kind in ("cooldown", "ineffective"):
             self._touch_activity(f"compression blocked ({reason})", provenance=ActivityProvenance.AGENT_COMPRESSION_COOLDOWN)
-        self._emit_warning(CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
-            tokens=preflight_tokens, threshold=threshold_tokens, reason=reason,
-        ))
+        message = (
+            CONTEXT_OVERFLOW_HARD_RISK_WARNING_TEMPLATE.format(
+                tokens=preflight_tokens, context_length=context_length, reason=reason,
+            )
+            if _hard_risk
+            else CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+                tokens=preflight_tokens, threshold=threshold_tokens, reason=reason,
+            )
+        )
+        self._emit_warning(message, category=CONTEXT_PRESSURE_STATUS_CATEGORY)
 
     def _warn_uncompressed_context_overflow(self, preflight_tokens: int, context_length: int) -> None:
         """Deduped warning when uncompressed context exceeds the model limit; points the user at /compact.
@@ -196,9 +227,26 @@ class StatusOutputMixin:
             self._emit_warning(t("display.notice.uncompressed_context_overflow",
                                  tokens=f"{preflight_tokens:,}", context_length=f"{context_length:,}"))
 
-    def _clear_context_overflow_warn(self) -> None:
-        """Reset the blocked-overflow warning dedup so it can re-fire on the next blocked turn."""
+    def _clear_context_overflow_warn(self, *, recovered: bool = False) -> None:
+        """Re-arm a context warning only after the request actually recovered.
+
+        A compression invocation can no-op (lock, timeout, or ineffective pass), so
+        beginning one is not evidence that the blocked-warning episode ended. Callers
+        pass ``recovered=True`` only for a provider-anchored figure below threshold or a
+        committed compaction re-measured below it (``turn_context_compaction``).
+        """
+        if not recovered:
+            return
+        previous = getattr(self, "_last_ctx_overflow_warn", None)
         self._last_ctx_overflow_warn = None
+        if isinstance(previous, tuple) and previous[:1] == ("ctx_overflow_blocked",):
+            # Typed-only edge: a renderer keyed on the category dismisses its card; legacy
+            # consumers that post status text (chat gateways) never receive it.
+            self._call_status_callback(
+                CONTEXT_PRESSURE_RECOVERED_STATUS_KIND, "Context pressure recovered.",
+                origin="_clear_context_overflow_warn", category=CONTEXT_PRESSURE_STATUS_CATEGORY,
+                typed_only=True,
+            )
 
     def _emit_notice(self, notice) -> None:
         """Fire a structured ``AgentNotice`` to the active driver (TUI / CLI)."""

@@ -108,7 +108,9 @@ class _FakeAgent:
                 f"but compression is currently blocked ({reason})."
             )
 
-    def _clear_context_overflow_warn(self):
+    def _clear_context_overflow_warn(self, *, recovered=False):
+        if not recovered:
+            return
         self._last_ctx_overflow_warn = None
 
     # --- methods the prologue calls ---
