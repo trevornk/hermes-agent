@@ -132,7 +132,16 @@ class StagedPlugin:
         self.target_digest = tree_digest(self.target) if self.target.exists() else None
         if self.target_digest != plugin["target_digest"]:
             raise ValueError("Plugin files changed while preparing the update; retry.")
-        sources = member_sources(enabled_plugin_dirs(installing=self.target))
+        # Member enumeration reads every selected manifest and fails closed on an unreadable
+        # one (manifest_selection.directory_manifests). A plugin that no home even names cannot
+        # be a member, so decide inactivity from the selections alone and never inspect
+        # unrelated manifests on its behalf (tests/pm/test_worker_publication.py).
+        from pm.plugins_state import enabled_plugins_ordered
+        names = {self.target.name, str(manifest.get("name") or self.target.name)}
+        named = any(name in names or name.rsplit("/", 1)[-1] in names
+                    for selected in enabled_plugins_ordered(installing=self.target).values()
+                    for name in selected)
+        sources = member_sources(enabled_plugin_dirs(installing=self.target)) if named else {}
         self.active = self.target.resolve() in sources
         self.members = {}
         if self.active:
