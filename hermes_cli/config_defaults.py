@@ -1926,6 +1926,10 @@ DEFAULT_CONFIG = {
         # Assignee when the orchestrator can't match one to an installed profile; "" = default
         # profile. A task never ends up with assignee=None.
         "default_assignee": "",
+        # Model (+ provider) for dispatched workers whose card has no per-card model override; "" =
+        # the assigned profile's own model. Decomposition roots always keep the profile model.
+        "worker_model": "",
+        "worker_provider": "",
         # Global cap: positive int = the HOST never has more than N tasks 'running' across all
         # boards and both dispatch lanes. None = ~MemTotal / 512 MiB clamped to [2, 8]; where
         # MemTotal is unreadable (macOS/Windows) None means no cap.
