@@ -230,3 +230,103 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+# --- plan-limited rules API (GitHub Free private repos) ---
+
+_PLAN_MSG = "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)"
+_SHA = "a" * 40
+
+
+def _fake_gh(monkeypatch, *, rules, runs=(), statuses=(), protection=()):
+    import subprocess
+    from hermes_cli import kanban_pr_acceptance as acc
+
+    def run(cmd, **kw):
+        ep = cmd[2]
+        if ep == "graphql":
+            out = {"data": {"repository": {"pullRequest": {
+                "headRefOid": _SHA, "baseRefName": "main", "state": "MERGED",
+                "baseRef": {"branchProtectionRule": {"requiredStatusChecks": list(protection)}}}}}}
+        elif "/rules/branches/" in ep:
+            if isinstance(rules, str):
+                raise subprocess.CalledProcessError(1, cmd, stderr=rules,
+                    output=json.dumps([{"message": "Upgrade to GitHub Pro or make this repository public to enable this feature."}])
+                    if rules == _PLAN_MSG else "")
+            out = rules
+        elif "/check-runs" in ep:
+            out = [{"total_count": len(runs), "check_runs": list(runs)}]
+        elif "/statuses" in ep:
+            out = [list(statuses)]
+        elif "/pulls/" in ep:
+            out = {"head": {"sha": _SHA}, "base": {"ref": "main"}, "state": "closed", "merged": True}
+        else:
+            raise AssertionError(ep)
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
+
+    monkeypatch.setattr(acc.subprocess, "run", run)
+    return acc
+
+
+def _cr(i, name, conclusion="success", status="completed", sha=_SHA):
+    return {"id": i, "name": name, "head_sha": sha, "app": {"id": 15368}, "status": status,
+            "conclusion": conclusion, "html_url": f"https://github.com/a/b/actions/runs/{i}"}
+
+
+PR = "https://github.com/a/b/pull/1"
+
+
+def test_plan_limited_rules_api_enforces_head_checks(monkeypatch):
+    acc = _fake_gh(monkeypatch, rules=_PLAN_MSG,
+                   runs=[_cr(1, "test"), _cr(2, "lint")])
+    r = acc.collect_acceptance(PR, PR)
+    assert r["ok"] and r["classification"] == "success"
+    assert r["policy_classification"] == "feature_unavailable"
+    assert r["policy_source"] == "exact_head_ci"
+    assert {c["name"] for c in r["checks"]} == {"test", "lint"}
+
+
+@pytest.mark.parametrize("bad,expected", [("failure", "failure"), (None, "pending")])
+def test_plan_limited_failed_or_pending_check_refuses(monkeypatch, bad, expected):
+    run = _cr(2, "lint", bad, status="in_progress") if bad is None else _cr(2, "lint", bad)
+    acc = _fake_gh(monkeypatch, rules=_PLAN_MSG, runs=[_cr(1, "test"), run])
+    r = acc.collect_acceptance(PR, PR)
+    assert not r["ok"] and r["classification"] == expected
+
+
+def test_plan_limited_without_any_evidence_refuses(monkeypatch):
+    acc = _fake_gh(monkeypatch, rules=_PLAN_MSG, runs=[])
+    r = acc.collect_acceptance(PR, PR)
+    assert not r["ok"] and r["classification"] == "missing"
+    assert r["policy_classification"] == "feature_unavailable"
+
+
+def test_plan_limited_stale_head_check_refuses(monkeypatch):
+    acc = _fake_gh(monkeypatch, rules=_PLAN_MSG, runs=[_cr(1, "test", sha="b" * 40)])
+    r = acc.collect_acceptance(PR, PR)
+    assert not r["ok"] and r["classification"] == "stale"
+
+
+@pytest.mark.parametrize("stderr", [
+    "gh: Resource not accessible by personal access token (HTTP 403)",
+    "gh: Must have admin rights to Repository. (HTTP 403)",
+    "gh: Upgrade to GitHub Pro (HTTP 404)",      # right words, wrong status
+    "gh: Bad credentials (HTTP 401)",
+])
+def test_other_rules_errors_stay_fail_closed(monkeypatch, stderr):
+    acc = _fake_gh(monkeypatch, rules=stderr, runs=[_cr(1, "test")])
+    r = acc.collect_acceptance(PR, PR)
+    assert not r["ok"] and r["classification"] == "auth"
+
+
+def test_successful_policy_discovery_still_governs(monkeypatch):
+    rule = {"type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": "test", "integration_id": 15368}]}}
+    # an unrelated failing check is NOT demanded when a real policy exists
+    acc = _fake_gh(monkeypatch, rules=[[rule]], runs=[_cr(1, "test"), _cr(2, "extra", "failure")])
+    r = acc.collect_acceptance(PR, PR)
+    assert r["ok"] and r["policy_source"] == "repository_policy"
+    # and an empty policy is still refused (no silent success)
+    acc = _fake_gh(monkeypatch, rules=[[]], runs=[_cr(1, "test")])
+    r = acc.collect_acceptance(PR, PR)
+    assert not r["ok"] and "No repository-required" in r["detail"]
