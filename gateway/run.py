@@ -3278,11 +3278,11 @@ _AUTO_RESET_CONTEXT_NOTES = {
 }
 
 
-def _write_runtime_status_quiet(**fields: Any) -> None:
+def _write_runtime_status_quiet(*, runner=None, **fields: Any) -> None:
     """Best-effort status publication; persistence must never abort or block the caller."""
     try:
         from gateway.status import publish_runtime_status
-        publish_runtime_status(**fields)
+        publish_runtime_status(**(fields if runner is None else {**fields, "active_agents": runner._active_work_count()}))
     except Exception:
         pass
 
@@ -4511,7 +4511,7 @@ def _start_gateway_housekeeping(
         # ``hermes gateway status`` / ``/api/status`` warn when it ages past 2x ``interval`` with the
         # PID alive — the thread (or a chore blocked on the loop) wedged (#113372). Runs first so a
         # wedged chore stops the NEXT stamp instead of a slow one delaying this tick's.
-        (1, "Runtime heartbeat", _write_runtime_status_quiet)]
+        (1, "Runtime heartbeat", lambda: _write_runtime_status_quiet(runner=runner))]
     if adapters is not None or runner is not None:
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
