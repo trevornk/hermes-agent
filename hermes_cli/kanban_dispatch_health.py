@@ -17,7 +17,7 @@ def dispatch_health_detail(results: Iterable[Optional[DispatchResult]]) -> str:
     held = describe_suppression(results)
     parts = [f" Last tick held back: {held}."] if held else []
     if any(reason == "active_pr" for res in results for _, reason in res.respawn_guarded):
-        parts.append(" active_pr is a duplicate-work hold; inspect PR handoff and block/unblock history.")
+        parts.append(" active_pr is a duplicate-work hold: the last run ended without a recorded handoff (crash, reclaim or timeout); inspect run history, or reassign to hand the PR to another profile.")
     if any(res.spawn_failed for res in results):
         parts.append(" Spawn failures recorded; check worker logs and profile health (venv, PATH, credentials).")
     parts.append(" Inspect `hermes kanban list --status ready` and run history for unresolved dispatch starvation.")
@@ -37,8 +37,8 @@ def dispatch_hold_diagnostics(conn: sqlite3.Connection, task: Any, now: int) -> 
     reason = check_respawn_guard(conn, task_id, lane=status)
     if reason is None:
         return []
-    detail = ("Duplicate-work protection is holding this existing PR. Inspect PR handoff and "
-              "block/unblock history; comments alone do not authorize continuation."
+    detail = ("Duplicate-work protection is holding this existing PR: the last run ended without a "
+              "recorded handoff (crash, reclaim or timeout). Inspect run history, or reassign to hand the PR over."
               if reason == "active_pr" else "The dispatcher is holding this task before claiming it.")
     return [Diagnostic(
         kind="dispatch_guarded", severity="warning", title=f"Dispatch held: {reason}",
