@@ -88,18 +88,7 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 
 @dataclass
 class DispatchResult:
-    """Outcome of a single ``dispatch`` pass.
-
-    ``kanban.default_assignee`` applied this tick before spawning (#27145). Surfaces the auto-assignment to
-    telemetry / CLI / dashboard so the operator can see when the dispatcher is acting on the fallback rule
-    ``kanban.max_in_progress_per_profile`` (#21582). Each entry is ``(task_id, assignee,
-    current_running_count)``. NOT an operator-actionable failure — the task will be picked up on a
-    subsequent tick when the assignee has capacity. Separate bucket so telemetry / dashboards can show "this
-    profile is busy" vs
-    the board's dispatch lock (issue #35240). A losing dispatcher does no DB writes this tick — the lock
-    holder is making progress on the same board. This is the steady-state signal that a single-writer guard
-    is
-    """
+    """Outcome of a single dispatch pass, including holds and failed launch attempts."""
 
     reclaimed: int = 0
     promoted: int = 0
@@ -155,6 +144,9 @@ class DispatchResult:
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
 
+    spawn_failed: list[str] = field(default_factory=list)
+    """Task ids whose workspace preparation or worker launch failed this tick."""
+
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
@@ -173,6 +165,8 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             continue
         for _task_id, reason in res.respawn_guarded:
             counts[reason] = counts.get(reason, 0) + 1
+        if res.spawn_failed:
+            counts["spawn_failed"] = counts.get("spawn_failed", 0) + len(res.spawn_failed)
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.owner_unavailable:
@@ -1575,7 +1569,8 @@ def check_respawn_guard(
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
     handoff event followed the comment: the named profile must work on that
     PR — or the latest run, ended after it, is the same profile's
-    iteration-budget exhaustion that the dispatcher re-queued to continue).
+    iteration-budget exhaustion that the dispatcher re-queued to continue,
+    or a run-bound needs_input block followed by an explicit unblock).
     The review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
@@ -1634,7 +1629,7 @@ def check_respawn_guard(
     # benign commands such as ``claude auth status`` (#117097).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err or ""):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -1671,6 +1666,9 @@ def check_respawn_guard(
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
                 conn, "task_events", task_id, max(pr_times),
                 "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
+            return None
+        from hermes_cli.kanban_db_continuation import is_needs_input_continuation
+        if is_needs_input_continuation(conn, task_id, max(pr_times)):
             return None
         if _is_budget_continuation(conn, task_id, max(pr_times)):
             return None
@@ -2177,6 +2175,7 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
+        result.spawn_failed.append(claimed.id)
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
@@ -2204,6 +2203,7 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
+        result.spawn_failed.append(claimed.id)
         from tools.process_registry import RestartSafeScopeUnavailable
 
         # The host refused the spawn (no restart-safe scope): nothing about the

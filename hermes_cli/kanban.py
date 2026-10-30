@@ -649,7 +649,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 return _err(f"no such task: {args.task}")
             diags_by_task = {args.task: kd.compute_task_diagnostics(
                 task, kb.list_events(conn, args.task), kb.list_runs(conn, args.task),
-                graph=kb.task_graph_context(conn, args.task), config=diag_config)}
+                graph=kb.task_graph_context(conn, args.task), config=diag_config, conn=conn)}
         else:
             # Fleet mode: pull all non-archived tasks + their events/runs.
             rows = list(conn.execute("SELECT * FROM tasks WHERE status != 'archived'").fetchall())
@@ -662,7 +662,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 for r in rows:
                     tid = r["id"]
                     dl = kd.compute_task_diagnostics(r, ev_by.get(tid, []), run_by.get(tid, []),
-                                                     graph=graph_by.get(tid), config=diag_config)
+                                                     graph=graph_by.get(tid), config=diag_config, conn=conn)
                     if dl:
                         diags_by_task[tid] = dl
 
