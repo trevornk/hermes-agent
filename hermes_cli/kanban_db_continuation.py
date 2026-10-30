@@ -1,4 +1,4 @@
-"""Read-only proof for a needs_input continuation of an existing PR."""
+"""Read-only proofs for continuing an existing PR after a run-bound park."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -33,18 +33,10 @@ def is_needs_input_continuation(conn: sqlite3.Connection, task_id: str, since: i
     """
     from hermes_cli import kanban_db as kb
 
-    run = conn.execute(
-        "SELECT r.*, t.assignee, t.status AS task_status, t.current_run_id "
-        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
-        "WHERE r.task_id = ? ORDER BY r.id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    if (run is None or run["outcome"] != "blocked" or run["task_status"] != "ready"
-            or run["current_run_id"] is not None or not run["profile"]
-            or run["profile"] != run["assignee"]):
+    run = _latest_blocked_run(conn, task_id)
+    if run is None:
         return False
-    started, ended = _proof_epoch(run["started_at"]), _proof_epoch(run["ended_at"])
-    if started is None or ended is None or started > ended:
-        return False
+    ended = _proof_epoch(run["ended_at"])
     block = conn.execute(
         "SELECT * FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'blocked' "
         "ORDER BY id DESC LIMIT 1", (task_id, run["id"]),
@@ -57,6 +49,71 @@ def is_needs_input_continuation(conn: sqlite3.Connection, task_id: str, since: i
     if not _pr_stamps_readable(conn, task_id):
         return False
     return _explicit_unblock_after(conn, task_id, block["id"], max(since, ended, blocked_at), run, blocked_at)
+
+
+def _latest_blocked_run(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
+    """A closed attempt still owned by the ready card's assignee."""
+    run = conn.execute(
+        "SELECT r.*, t.assignee, t.status AS task_status, t.current_run_id "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.task_id = ? ORDER BY r.id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if (run is None or run["outcome"] != "blocked" or run["task_status"] != "ready"
+            or run["current_run_id"] is not None or not run["profile"]
+            or run["profile"] != run["assignee"]):
+        return None
+    started, ended = _proof_epoch(run["started_at"]), _proof_epoch(run["ended_at"])
+    if started is None or ended is None or started > ended:
+        return None
+    return run
+
+
+def is_dependency_continuation(conn: sqlite3.Connection, task_id: str, since: int) -> bool:
+    """Resume only the latest worker's typed dependency park after its gates finish."""
+    from hermes_cli import kanban_db as kb
+
+    run = _latest_blocked_run(conn, task_id)
+    if run is None:
+        return False
+    # _route_block always emits dependency_wait for this kind. An in-place
+    # classified blocked event has no run and cannot authorize continuation.
+    block = conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'dependency_wait' "
+        "ORDER BY id DESC LIMIT 1", (task_id, run["id"]),
+    ).fetchone()
+    if block is None or kb._json_dict(block["payload"]).get("kind") != "dependency":
+        return False
+    blocked_at, ended = _proof_epoch(block["created_at"]), _proof_epoch(run["ended_at"])
+    if blocked_at is None or blocked_at < ended or not _pr_stamps_readable(conn, task_id):
+        return False
+    if (conn.execute("SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1", (task_id,)).fetchone() is None
+            or not kb._parents_satisfied(conn, task_id)):
+        return False
+    return _dependency_promotion_after(conn, task_id, block["id"], max(since, ended, blocked_at), run, blocked_at)
+
+
+def _dependency_promotion_after(
+    conn: sqlite3.Connection, task_id: str, block_id: int, after: int, run: sqlite3.Row, blocked_at: int,
+) -> bool:
+    """One promotion, with only observations and links around it, proves release."""
+    promoted = False
+    for event in conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? AND id > ? ORDER BY id",
+        (task_id, block_id),
+    ):
+        if event["kind"] in {"commented", "respawn_guarded", "heartbeat", "linked"}:
+            continue
+        if event["kind"] == "worker_result":
+            if not _blocked_run_result(conn, task_id, run, event, block_id, blocked_at):
+                return False
+            continue
+        if event["kind"] != "promoted" or promoted:
+            return False
+        stamp = _proof_epoch(event["created_at"])
+        if stamp is None or not after < stamp <= int(time.time()):
+            return False
+        promoted = True
+    return promoted
 
 
 def _explicit_unblock_after(

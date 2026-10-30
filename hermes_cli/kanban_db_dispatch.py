@@ -1653,11 +1653,9 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
-    #    Nor is a wall-clock max_runtime kill. An iteration-budget exhaustion
-    #    is different: the dispatcher itself re-queued that run to continue, so
-    #    when it is the latest run, by the profile still on the card, and ended
-    #    after the newest PR comment, the retry is that implementer finishing its
-    #    own PR (whose URL is in the context it inherits), not a duplicate.
+    #    Budget exhaustion or a proven needs_input/dependency release resumes
+    #    the latest run's implementer on its existing PR, inherited in context.
+    #    A wall-clock max_runtime kill grants no such continuation.
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
                 if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
@@ -1667,8 +1665,10 @@ def check_respawn_guard(
                 conn, "task_events", task_id, max(pr_times),
                 "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
             return None
-        from hermes_cli.kanban_db_continuation import is_needs_input_continuation
+        from hermes_cli.kanban_db_continuation import is_dependency_continuation, is_needs_input_continuation
         if is_needs_input_continuation(conn, task_id, max(pr_times)):
+            return None
+        if is_dependency_continuation(conn, task_id, max(pr_times)):
             return None
         if _is_budget_continuation(conn, task_id, max(pr_times)):
             return None
