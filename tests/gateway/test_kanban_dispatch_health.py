@@ -45,7 +45,7 @@ def test_gateway_warns_with_actionable_cause(monkeypatch, caplog, hold, failed):
     warning = caplog.text
     assert "dispatcher stuck" in warning
     if hold:
-        assert "active_pr=1" in warning and "PR handoff and block/unblock history" in warning
+        assert "active_pr=1" in warning and "last run ended without a recorded handoff" in warning
     if failed:
         assert "spawn_failed=1" in warning and "Spawn failures recorded" in warning
     else:

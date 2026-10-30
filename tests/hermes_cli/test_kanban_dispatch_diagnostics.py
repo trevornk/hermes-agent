@@ -40,7 +40,10 @@ def test_task_diagnostics_distinguish_hold_continuation_and_failure(tmp_path, mo
             clock[0] += 5
             assert kb.unblock_task(conn, tid)
             if scenario == "active_pr":
-                # A fresh PR comment supersedes the unblock; prose never authorizes.
+                # A later attempt crashed without a handoff; its PR stays guarded.
+                assert kb.claim_task(conn, tid) is not None
+                kbd._record_task_failure(conn, tid, error="worker exited 1", outcome="crashed",
+                                         release_claim=True, end_run=True)
                 clock[0] += 1
                 kb.add_comment(conn, tid, author="desktop", body="Approved https://github.com/example/repo/pull/8")
         # A historical event must not be mistaken for the current predicate.
