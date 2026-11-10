@@ -154,3 +154,94 @@ def test_session_rename_runs_writer_open_and_update_off_event_loop(monkeypatch, 
         assert result["ok"] is True and result["title"] == "renamed"
         assert db.get_session("sess-1")["title"] == "renamed"
     assert write_threads and all(thread_id != loop_thread for thread_id in write_threads)
+
+
+class _MessagesDB:
+    """Records one open per DB instance; get_messages blocks on a barrier so a test can force
+    two concurrent requests to overlap before either finishes."""
+
+    def __init__(self, open_calls: list, start_gate: threading.Event, release_gate: threading.Event):
+        self._open_calls = open_calls
+        self._start_gate = start_gate
+        self._release_gate = release_gate
+        open_calls.append(1)
+
+    def resolve_resume_session_id(self, sid):
+        return sid
+
+    def get_messages(self, sid, *, limit, offset, latest, include_compacted, include_ancestors=False):
+        self._start_gate.set()
+        self._release_gate.wait(timeout=5)
+        return [{"id": sid, "offset": offset}]
+
+    def close(self):
+        pass
+
+
+def test_concurrent_identical_message_reads_share_one_db_open(monkeypatch):
+    """[carried, dashboard_ws_handshake_offload.patch] A dashboard reconnect storm re-requests
+    the same session's transcript with identical params; two concurrent requests for the same
+    (profile, session_id, limit, offset, order, include_compacted) must open/scan the SessionDB
+    ONCE, not once per request — the second request rides the first's in-flight read instead of
+    stacking another full table scan onto the executor."""
+    open_calls: list = []
+    start_gate = threading.Event()
+    release_gate = threading.Event()
+
+    def _open_db(profile=None, *, read_only):
+        return _MessagesDB(open_calls, start_gate, release_gate)
+
+    monkeypatch.setattr(_web_server_sessions, "_open_session_db_for_profile", _open_db)
+    monkeypatch.setattr(_rt_sessions, "_resolve_session_id", lambda db, sid: sid)
+
+    async def _scenario():
+        call = lambda: _rt_sessions.get_session_messages(
+            "sess-1", limit=None, offset=0, order=None, include_compacted=False)
+        first = asyncio.ensure_future(call())
+        # Wait until the first request is actually inside the (blocked) DB read, so the second
+        # request is guaranteed to observe it as in-flight rather than racing ahead of it.
+        await asyncio.to_thread(start_gate.wait, 5)
+        second = asyncio.ensure_future(call())
+        await asyncio.sleep(0.05)  # let `second` reach _coalesced_to_thread before releasing
+        release_gate.set()
+        return await asyncio.gather(first, second)
+
+    results = asyncio.run(_scenario())
+
+    assert len(open_calls) == 1, f"expected exactly one SessionDB open, got {len(open_calls)}"
+    assert results[0] == results[1]
+
+
+def test_concurrent_different_message_reads_are_not_coalesced(monkeypatch):
+    """Requests for different params (here: different offsets) must NOT share a read — coalescing
+    is keyed on the full parameter tuple, not just the session id."""
+    open_calls: list = []
+
+    def _open_db(profile=None, *, read_only):
+        # No blocking needed here: each call gets its own gate pair.
+        return _MessagesDB(open_calls, threading.Event(), threading.Event())
+
+    monkeypatch.setattr(_web_server_sessions, "_open_session_db_for_profile", _open_db)
+    monkeypatch.setattr(_rt_sessions, "_resolve_session_id", lambda db, sid: sid)
+
+    # Unblock every DB instance's get_messages immediately (no cross-request race to prove here).
+    orig_init = _MessagesDB.__init__
+
+    def _init_and_release(self, open_calls_, start_gate, release_gate):
+        orig_init(self, open_calls_, start_gate, release_gate)
+        release_gate.set()
+
+    monkeypatch.setattr(_MessagesDB, "__init__", _init_and_release)
+
+    async def _scenario():
+        return await asyncio.gather(
+            _rt_sessions.get_session_messages(
+                "sess-1", limit=None, offset=0, order=None, include_compacted=False),
+            _rt_sessions.get_session_messages(
+                "sess-1", limit=None, offset=50, order=None, include_compacted=False),
+        )
+
+    results = asyncio.run(_scenario())
+
+    assert len(open_calls) == 2, f"expected two independent SessionDB opens, got {len(open_calls)}"
+    assert results[0] != results[1]
