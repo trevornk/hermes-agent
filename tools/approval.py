@@ -38,6 +38,7 @@ from tools.approval_floors import (
 )
 from tools.approval_gateway_wait import _await_gateway_decision
 from tools.approval_provenance import allowlisted_result, preapproved_result
+from tools.process_kill_guard import detect_protected_process_kill
 from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
 from tools.approval_smart import _smart_verdict
 
@@ -1186,7 +1187,7 @@ def _user_deny_block(command: str) -> dict | None:
     return _user_deny_block_result(deny_pattern)
 
 
-def _floor_block(command: str, *, sudo_guard: bool = False) -> dict | None:
+def _floor_block(command: str, *, sudo_guard: bool = False, env_type: str = "local") -> dict | None:
     """Unconditional floors, BEFORE yolo / mode=off / cron approve-mode so no
     session-level setting can bypass them: hardline catastrophic commands,
     password-piping to ``sudo -S`` with no SUDO_PASSWORD configured (full guard
@@ -1204,6 +1205,12 @@ def _floor_block(command: str, *, sudo_guard: bool = False) -> dict | None:
     if runtime_target:
         logger.warning("Runtime self-delete block: %s (command: %s)", runtime_target, command[:200])
         return _hardline_block_result(f"recursive/any delete of {runtime_target}", command)
+    # Resolves the match set of pkill/killall/kill/xargs-kill read-only and refuses when it contains
+    # Hermes' own service/worker processes or this agent's ancestors (the 66-process pkill incident).
+    kill_target = detect_protected_process_kill(command, env_type)
+    if kill_target:
+        logger.warning("Process-kill block: %s (command: %s)", kill_target, command[:200])
+        return _hardline_block_result(kill_target, command)
     if sudo_guard:
         is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
         if is_sudo_guess:
@@ -1220,7 +1227,7 @@ def check_dangerous_command(command: str, env_type: str,
     Returns ``{"approved": True/False, "message": str or None, ...}``."""
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
-    blocked = _floor_block(command)
+    blocked = _floor_block(command, env_type=env_type)
     if blocked is not None:
         return blocked
     if _yolo_active() or approval_context._get_approval_mode() == "off":
@@ -1282,7 +1289,7 @@ def check_all_command_guards(command: str, env_type: str,
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
 
-    blocked = _floor_block(command, sudo_guard=True)
+    blocked = _floor_block(command, sudo_guard=True, env_type=env_type)
     if blocked is not None:
         return blocked
 

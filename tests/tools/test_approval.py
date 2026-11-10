@@ -2112,3 +2112,45 @@ class TestCliApprovalTimeoutClassifiedSeparately:
         assert result.get("user_consent") is False
         assert "timed out without user response" in result["message"]
         assert "Silence is not consent" in result["message"]
+
+
+@pytest.mark.spawns_gateway_lookalike
+class TestProcessKillFloorRegexPatterns:
+    """t_c0650248: ``pkill -f 'hermes.*gateway'`` reached the gateway because the floor read the
+    regex ``*`` as an unresolved shell glob and allowed the kill. The floor must resolve a quoted
+    pattern against live argv (read-only) even when approvals are off."""
+
+    @pytest.fixture
+    def fake_gateway(self):
+        import subprocess
+        import sys
+        import uuid
+        token = uuid.uuid4().hex[:10]
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)",
+                                 "hermes_cli.main", "--profile", "default", "gateway", "run", token])
+        yield token
+        proc.kill()
+        proc.wait()
+
+    @pytest.mark.parametrize("template", [
+        "pkill -f 'hermes.*gateway run {t}'",
+        'pkill -f "hermes.*gateway.*{t}"',
+        "pkill -9 -f 'hermes.*gateway.*{t}'",
+        "kill $(pgrep -f 'hermes.*gateway.*{t}')",
+        "pgrep -f 'hermes.*gateway.*{t}' | xargs kill",
+    ])
+    def test_regex_pattern_hitting_gateway_is_blocked_with_approvals_off(self, fake_gateway, template, monkeypatch):
+        from tools import process_kill_guard
+        import re
+        monkeypatch.setattr(process_kill_guard, "_protected_regexes",
+                            lambda: [re.compile(p) for p in process_kill_guard._DEFAULT_PROTECTED])
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "off")
+        result = approval_module.check_all_command_guards(template.format(t=fake_gateway), "local")
+        assert result["approved"] is False
+        assert "BLOCKED" in result["message"]
+
+    def test_regex_pattern_missing_every_protected_process_is_allowed(self, fake_gateway, monkeypatch):
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "off")
+        result = approval_module.check_all_command_guards(
+            f"pkill -f 'hermes.*gateway.*{fake_gateway}-absent'", "local")
+        assert result["approved"] is True
