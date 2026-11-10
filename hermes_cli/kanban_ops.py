@@ -303,7 +303,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove archived tasks' scratch workspaces, old events, and old worker logs."""
+    """Retry terminal scratch cleanup, archived worktrees, old events and worker logs."""
     import shutil
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
@@ -314,7 +314,8 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         rows = conn.execute(
             "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
-            "WHERE status = 'archived'"
+            "WHERE status = 'archived' OR "
+            "(workspace_kind = 'scratch' AND status IN ('done', 'failed', 'cancelled'))"
         ).fetchall()
         for row in rows:
             if row["workspace_kind"] == "worktree":
@@ -337,8 +338,11 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             # completion, and rmtree refuses a symlink (so it must not be counted).
             if not path.is_dir() or path.is_symlink() or not kbw._is_managed_scratch_path(path):
                 continue
+            if kbw._has_active_children(conn, row["id"]):
+                continue
             if kbw._defer_shared_workspace_cleanup(conn, row["id"], path):
                 continue
+            kbw.release_lsp_clients(str(path))
             shutil.rmtree(path, ignore_errors=True)
             if not path.exists():
                 removed_ws += 1

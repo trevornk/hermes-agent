@@ -7,6 +7,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -121,7 +122,7 @@ def _conn_uses_path(
 
 
 def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
-    """Every other board's ``kanban.db``. Raises ``OSError`` when the set is unknown.
+    """Other non-archived boards' DBs. Raises ``OSError`` when the set is unknown.
 
     ``kanban_db_path`` follows ``HERMES_KANBAN_DB`` and would collapse every
     slug onto the pinned file, so the scan uses the on-disk layout: the
@@ -136,8 +137,15 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
     root = _kb.boards_root()
     if root.is_dir():
         for child in root.iterdir():
-            if child.is_dir():
-                candidates.append(child / "kanban.db")
+            if not child.is_dir() or child.name == "_archived":
+                continue
+            try:
+                metadata = json.loads((child / "board.json").read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                metadata = None  # Unreadable metadata must not hide a live board.
+            if isinstance(metadata, dict) and metadata.get("archived") is True:
+                continue
+            candidates.append(child / "kanban.db")
     found: list[Path] = []
     seen: set[Path] = set()
     for path in candidates:
@@ -158,6 +166,12 @@ def _other_board_uses_path(db_file: Path, task_id: str, key: str) -> bool:
     other = sqlite3.connect(uri, uri=True, timeout=1.0)
     try:
         other.row_factory = sqlite3.Row
+        # Empty/uninitialised files have no sharers; all other DB errors still
+        # propagate so cleanup fails closed on locked or corrupt boards.
+        if other.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'"
+        ).fetchone() is None:
+            return False
         return _conn_uses_path(other, task_id, key, exclude_task_id=False)
     finally:
         other.close()
