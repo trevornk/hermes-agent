@@ -822,6 +822,14 @@ def _handle_block(args: dict, **kw) -> str:
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
     with _board(args.get("board")) as (kb, conn):
+        brief = args.get("brief")
+        if "brief" in args:
+            try:
+                kb._validate_decision_brief(brief)
+                brief = _redact(brief)
+                kb._validate_decision_brief(brief)
+            except ValueError as exc:
+                raise _Reject(str(exc)) from exc
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
         # The goal loop treats ANY blocked status as terminal, so kanban_block
@@ -844,6 +852,9 @@ def _handle_block(args: dict, **kw) -> str:
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
         landed_kind = kb.get_task(conn, tid).block_kind
         extra: dict = {"block_kind": landed_kind}
+        if brief is not None:
+            kb.set_decision_brief(conn, tid, brief)
+            extra["brief_set"] = True
         if kind == "dependency" and landed_kind != kind:
             # block_task re-kinds a dependency wait that no open parent can satisfy.
             extra["requested_kind"] = kind

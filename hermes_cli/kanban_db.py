@@ -3079,6 +3079,44 @@ def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> 
     return candidate
 
 
+DECISION_BRIEF_START = "<!-- decision-brief:start -->"
+DECISION_BRIEF_END = "<!-- decision-brief:end -->"
+
+
+def _validate_decision_brief(brief: str) -> None:
+    if not isinstance(brief, str) or not brief.strip():
+        raise ValueError("brief must be a non-empty string")
+    if len(brief) > 6000:
+        raise ValueError("brief must be at most 6000 characters")
+    if DECISION_BRIEF_START in brief or DECISION_BRIEF_END in brief:
+        raise ValueError("brief must not contain decision-brief delimiters")
+
+
+def _decision_brief_remainder(body: str) -> str:
+    """Remove only a leading brief and its single blank-line separator."""
+    if body.startswith(DECISION_BRIEF_START):
+        _, end, remainder = body.partition(DECISION_BRIEF_END)
+        if end:
+            return remainder.removeprefix("\n\n")
+    return body
+
+
+def set_decision_brief(conn: sqlite3.Connection, task_id: str, brief: str) -> bool:
+    """Upsert a leading decision brief without changing the remaining body bytes."""
+    _validate_decision_brief(brief)
+    with write_txn(conn):
+        row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        remainder = _decision_brief_remainder(row["body"] or "")
+        body = f"{DECISION_BRIEF_START}\n{brief.strip()}\n{DECISION_BRIEF_END}"
+        if remainder:
+            body += "\n\n" + remainder
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, task_id))
+        _append_event(conn, task_id, "edited", {"fields": ["body"], "decision_brief": True})
+    return True
+
+
 def edit_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, priority: Optional[int] = None,
