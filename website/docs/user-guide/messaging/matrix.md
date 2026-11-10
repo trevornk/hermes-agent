@@ -361,7 +361,13 @@ Hermes supports Matrix end-to-end encryption, so you can chat with your bot in e
 
 ### Requirements
 
-E2EE requires the `mautrix` library with encryption extras and the `libolm` C library:
+E2EE requires the `mautrix` library with encryption extras and the `libolm` C library.
+PM installs the encryption dependencies on Linux. On macOS, the same `matrix`
+extra installs the base messaging dependencies only: existing `off` and `optional`
+modes can use unencrypted rooms, while `required` (including legacy
+`MATRIX_ENCRYPTION=true`) fails closed without crypto. Installing the base extra
+never changes the configured E2EE mode. For encrypted rooms on macOS, use
+[proxy mode](#proxy-mode-e2ee-on-macos) with a Linux Matrix gateway.
 
 ```bash
 # Request the declared Matrix dependencies
@@ -373,9 +379,6 @@ You also need `libolm` installed on your system:
 ```bash
 # Debian/Ubuntu
 sudo apt install libolm-dev
-
-# macOS
-brew install libolm
 
 # Fedora
 sudo dnf install libolm-devel
@@ -716,10 +719,12 @@ history, so other clients trust it immediately.
 
 ## Proxy Mode (E2EE on macOS)
 
-The `matrix` extra is gated to Linux. On macOS or Windows, run the Matrix
-adapter and encryption dependencies in a Linux container and forward requests
-to the native agent. The example below uses a macOS host; the same separation
-applies to Windows with the corresponding host address and authentication.
+The encryption dependencies of the `matrix` extra are gated to Linux; native
+macOS supports unencrypted Matrix messaging only. For E2EE on macOS, or for
+Matrix on Windows, run the Matrix adapter and encryption dependencies in a
+Linux container and forward requests to the native agent. The example below
+uses a macOS host; the same separation applies to Windows with the corresponding
+host address and authentication.
 
 ### How It Works
 
