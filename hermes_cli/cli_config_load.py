@@ -71,6 +71,12 @@ def _parse_reasoning_config(effort) -> dict | None:
 
 def _parse_service_tier_config(raw: str) -> str | None:
     """Parse a persisted fast-mode preference: None, "priority", "ultrafast", "auto", or "cold"."""
+    # [carried, kanban_worker_no_paid_fast_mode.patch] Background board work must not inherit an
+    # interactive paid/priority fast tier: a dispatcher-spawned worker would silently bill at the
+    # interactive rate. Process-scoped -- the persisted preference is untouched, so the human's own
+    # `fast` setting still applies to their interactive sessions.
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return None
     from agent.fast_mode import NORMAL_TIER_WORDS, parse_service_tier
 
     tier = parse_service_tier(raw)

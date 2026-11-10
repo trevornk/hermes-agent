@@ -27,6 +27,20 @@ class TestParseServiceTierConfig(unittest.TestCase):
         self.assertEqual(self._parse("fast"), "priority")
         self.assertEqual(self._parse("priority"), "priority")
 
+    def test_kanban_worker_does_not_inherit_paid_fast_mode(self):
+        import os
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_fixture"}):
+            for raw in ("fast", "priority", "auto", "cold", "normal", ""):
+                with self.subTest(raw=raw):
+                    self.assertIsNone(self._parse(raw))
+
+    def test_empty_worker_marker_preserves_interactive_fast_mode(self):
+        import os
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": ""}):
+            self.assertEqual(self._parse("fast"), "priority")
+
+
+
 class TestHandleFastCommand(unittest.TestCase):
     def _make_cli(self, service_tier=None):
         return SimpleNamespace(
