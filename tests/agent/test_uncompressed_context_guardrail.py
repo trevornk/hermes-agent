@@ -71,7 +71,9 @@ def test_clear_rearms_the_warning():
     agent._emit_warning = MagicMock()
 
     agent._warn_uncompressed_context_overflow(15_000, 10_000)
-    agent._clear_context_overflow_warn()
+    # Carried neo_context_warning contract: only an observed recovery re-arms; a bare clear
+    # (a compression *attempt*) is deliberately a no-op.
+    agent._clear_context_overflow_warn(recovered=True)
     agent._warn_uncompressed_context_overflow(15_500, 10_000)
 
     assert agent._emit_warning.call_count == 2

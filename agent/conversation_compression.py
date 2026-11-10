@@ -131,8 +131,14 @@ COMPRESSION_REFUSED_WOULD_GROW_WARNING = ("⚠️ Compression refused: the gener
 # (_TELEGRAM_NOISY_STATUS_RE) or ROUTINE_COMPRESSION_STATUS_SAMPLES; tests/gateway/test_run_status_filter.py pins it.
 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE = (
     "⚠ Context is over the compression threshold (~{tokens:,} tokens >= {threshold:,}) "
-    "but compression is currently blocked ({reason}). The model may stop responding. Run /new to start a fresh "
-    "session or /compress to retry immediately."
+    "but automatic compression is currently blocked ({reason}). This is not the model context limit; "
+    "you can continue, run /compress to retry now, or /new to start fresh."
+)
+
+CONTEXT_OVERFLOW_HARD_RISK_WARNING_TEMPLATE = (
+    "⚠ Context is at or beyond the model context limit (~{tokens:,} tokens >= {context_length:,}). "
+    "Automatic compression is currently blocked ({reason}); the next request may fail. "
+    "Run /compress to retry now or /new to start fresh."
 )
 
 # Formatted from the same constants the emission sites use, so noise-filter tests exercise the ACTUAL wording.
