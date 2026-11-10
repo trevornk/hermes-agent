@@ -18,6 +18,9 @@ from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+_RULES_ENDPOINT = re.compile(
+    r"repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:rules/branches/[^/?]+|branches/[^/?]+/protection)")
+_RULES_PLAN_MESSAGE = "Upgrade to GitHub Pro or make this repository public to enable this feature."
 
 
 def validate_contract(value: str | None) -> str:
@@ -40,11 +43,12 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
                                 text=True, encoding="utf-8", errors="replace", timeout=30,
                                 check=True, env=_gh_env(profile_home))
     except subprocess.CalledProcessError as exc:
-        # 401/403/404 = the login cannot see this repository (wrong profile identity
-        # or missing grant), not a transient API failure. Persist only the status
-        # code + endpoint, never gh's stderr (credentials/host details).
-        denied = re.search(r"HTTP (40[134])", exc.stderr or "")
+        # A known rules-plan limitation is distinct from a refused login. All other
+        # 401/403/404 reads stay auth failures; never persist gh stderr or response bodies.
+        denied = re.search(r"HTTP (40[134])\b", exc.stderr or "")
         if denied:
+            if denied[1] == "403" and _rules_feature_unavailable(endpoint, exc.stdout, paginate=paginate):
+                raise _GateFeatureUnavailableError from None
             raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
         if exc.returncode == 4:  # gh's authentication-required exit: this profile has no login
             raise _GateAuthError(f"gh has no login for {endpoint.split('?')[0]}") from None
@@ -59,6 +63,23 @@ class _GateAuthError(RuntimeError):
     """gh was refused at HTTP 401/403/404 (or GraphQL returned no repository):
     this profile's login cannot see the repo — an identity problem to fix, not
     an infrastructure blip to retry."""
+
+
+class _GateFeatureUnavailableError(RuntimeError):
+    """GitHub explicitly reports that the repository's plan cannot expose rules."""
+
+
+def _rules_feature_unavailable(endpoint: str, body: str | None, *, paginate: bool) -> bool:
+    if not _RULES_ENDPOINT.fullmatch(endpoint.split('?')[0]):
+        return False
+    try:
+        response = json.loads(body or "")
+    except ValueError:
+        return False
+    # --paginate --slurp also envelopes an error response; accept exactly one page.
+    if paginate and isinstance(response, list) and len(response) == 1:
+        response = response[0]
+    return isinstance(response, dict) and response.get("message") == _RULES_PLAN_MESSAGE
 
 
 def _gh_env(profile_home: str | None) -> dict[str, str] | None:
@@ -82,11 +103,12 @@ def _gh_env(profile_home: str | None) -> dict[str, str] | None:
         # credential, so no scrub list sees it; the target's own value is overlaid from its .env.
         base.pop("GH_CONFIG_DIR", None)
     env = served_profile_child_env(base=base, target_home=profile_home, inherit_credentials=True)
-    if routed and not (env.keys() & {"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"}):
-        # HOME/XDG_CONFIG_HOME are still the launch process's: without a login of its own the
-        # child would fall through to ~/.config/gh/hosts.yml — the ambient login. Pin gh's config
-        # to a profile-owned dir so it fails "not logged in" (exit 4 -> auth) instead.
-        env["GH_CONFIG_DIR"] = str(Path(profile_home) / "gh")
+    if routed and not any(env.get(key) for key in ("GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR")):
+        # Prefer the worker sandbox's existing login, keeping the legacy profile dir
+        # as fallback. Always pin a profile-owned dir: HOME/XDG still belong to launch.
+        sandbox_config = Path(profile_home) / "home" / ".config" / "gh"
+        config = sandbox_config if (sandbox_config / "hosts.yml").is_file() else Path(profile_home) / "gh"
+        env["GH_CONFIG_DIR"] = str(config)
     return env
 
 
@@ -133,18 +155,28 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
+        plan_limited = False
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                         paginate=True, profile_home=profile_home)
+        except _GateFeatureUnavailableError:
+            plan_limited = True
+            rules = []
+        # Policy availability is separate from acceptance: an unavailable feature is
+        # neither an authenticated policy read nor evidence that no rules exist.
+        receipt["policy_classification"] = "feature_unavailable" if plan_limited else "success"
+        receipt["policy_source"] = "exact_head_ci" if plan_limited else "repository_policy"
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
                     required.update((r["context"], r.get("integration_id"))
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
-        if not required:
+        if not required and not plan_limited:
             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
             return receipt
-        pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
+        check_filter = "all" if plan_limited else "latest"
+        pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter={check_filter}",
                      paginate=True, profile_home=profile_home)
         runs = [run for page in pages for run in page["check_runs"]]
         if len({r["id"] for r in runs}) != pages[0]["total_count"]:
@@ -152,6 +184,18 @@ def collect_acceptance(contract: str, published_pr: str | None,
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
         outcomes = []
+        if plan_limited:
+            # Owner-approved compatibility contract: every observed run AND status
+            # on this head must succeed. No skipped/neutral or superseded-status
+            # exemption, and no success when CI evidence is absent.
+            for check in runs + statuses:
+                name = check["name"] if "conclusion" in check else check["context"]
+                evidence = _check_evidence(check, sha, name)
+                receipt["checks"].append(evidence)
+                outcomes.append(evidence["classification"])
+            if not outcomes:
+                receipt["detail"] = "Branch policy is unavailable on this plan and the exact PR head has no CI evidence."
+                return receipt
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
                         (app_id in (None, -1) or r["app"]["id"] == app_id)]
@@ -162,18 +206,17 @@ def collect_acceptance(contract: str, published_pr: str | None,
                 outcomes.append("missing")
                 receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
             for check in selected:
-                is_run = "conclusion" in check
-                outcome = check.get("conclusion") if is_run else check["state"]
-                classification = _classify(check, sha, outcome, is_run)
-                outcomes.append(classification)
-                receipt["checks"].append({"name": context, "id": check["id"],
-                    "url": check.get("html_url") or check.get("target_url"),
-                    "head_sha": check.get("head_sha", check.get("sha")),
-                    "classification": classification, "conclusion": outcome})
+                evidence = _check_evidence(check, sha, context)
+                outcomes.append(evidence["classification"])
+                if not plan_limited:
+                    receipt["checks"].append(evidence)
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
+            return receipt
+        if plan_limited and not (current["state"] == "closed" and current.get("merged") is True):
+            receipt.update(classification="pending", detail="Plan-limited acceptance requires the PR to be merged with the expected head.")
             return receipt
         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
         receipt["ok"] = receipt["classification"] == "success"
@@ -188,6 +231,15 @@ def collect_acceptance(contract: str, published_pr: str | None,
         # Never persist gh stderr (credentials/host details); the failed phase is actionable.
         receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
         return receipt
+
+
+def _check_evidence(check: dict, sha: str, name: str) -> dict:
+    is_run = "conclusion" in check
+    outcome = check.get("conclusion") if is_run else check["state"]
+    return {"name": name, "id": check["id"],
+            "url": check.get("html_url") or check.get("target_url"),
+            "head_sha": check.get("head_sha", check.get("sha")),
+            "classification": _classify(check, sha, outcome, is_run), "conclusion": outcome}
 
 
 def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
