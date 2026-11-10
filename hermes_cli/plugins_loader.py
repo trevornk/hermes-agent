@@ -121,12 +121,15 @@ def run_with_load_deadline(plugin_key: str, ctx: PluginContext, fn: Callable[[],
     # Re-entrant load on our own deadline worker: run inline; the outer deadline covers it.
     outer_scope = _IN_PLUGIN_LOAD.get()
     if outer_scope is not None:
+        ctx._load_deadline = getattr(outer_scope[0], "_load_deadline", None)
         outer_scope.append(ctx)
         try:
             return fn()
         finally:
             outer_scope.remove(ctx)
     timeout = _resolve_plugin_load_timeout()
+    # Absolute monotonic deadline includes import time; plugins may cooperate.
+    ctx._load_deadline = time.monotonic() + timeout if timeout > 0 else None
     if timeout <= 0:
         return fn()
     _reserve_abandoned_loader_slot()
