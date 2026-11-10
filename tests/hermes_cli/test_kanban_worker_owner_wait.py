@@ -57,8 +57,10 @@ async def test_worker_fails_at_once_when_the_owner_is_not_transiently_down(monke
     monkeypatch.setattr(kanban_worker_client.asyncio, "sleep", _no_sleep)
     monkeypatch.delenv("HERMES_TUI_GATEWAY_URL", raising=False)
 
-    with pytest.raises(gateway_client.GatewayClientError):
+    # Typed: nothing was submitted, so the card is requeued unspent (exit 69), never booked a crash.
+    with pytest.raises(kanban_worker_client.OwnerTransportUnavailable) as caught:
         await kanban_worker_client.run({"task_id": "t1"}, str(tmp_path / "kanban.db"))
+    assert isinstance(caught.value.cause, gateway_client.GatewayUnavailableError)
     assert submitted == []
 
 

@@ -47,6 +47,25 @@ class WorkerPersistenceError(RuntimeError):
     pass
 
 
+# How long one owner call may wait for its receipt once sent. The owner serves every transport on
+# one loop, so a long GIL hold there (a full ``gc.collect`` in a large process) spends this budget
+# with the request still queued; the timeout is a TRANSPORT verdict, never the owner's answer.
+RECEIPT_BUDGET_S = 20.0
+
+
+class WorkerReceiptTimeout(TimeoutError):
+    """No receipt within the budget: a transport failure, distinct from an owner's error reply.
+
+    ``reason`` stays the bounded code callers matched before (``worker_receipt_timeout``); the
+    message adds what the log line used to lack: which call, how long it waited, which owner."""
+    reason = 'worker_receipt_timeout'
+
+    def __init__(self, method, timeout, endpoint=None):
+        self.method, self.timeout, self.endpoint = method, float(timeout), endpoint
+        owner = f'; owner={endpoint}' if endpoint else ''
+        super().__init__(f'{self.reason} (method={method} after {self.timeout:.1f}s{owner})')
+
+
 def _caller_summary(limit=8):
     """module:function:line of the frames above this store (its own frames skipped), never
     locals or argument values: best-effort callers swallow the guard's raise (#139029)."""
@@ -109,7 +128,8 @@ class _OwnerLink:
         try:
             reply = self.replies.get(timeout=timeout)
         except queue.Empty:
-            raise TimeoutError('worker_receipt_timeout') from None
+            # The link knows only its budget; ``WorkerRPC`` names the call and the owner.
+            raise WorkerReceiptTimeout(None, timeout) from None
         if isinstance(reply, BaseException):
             raise reply
         return reply
@@ -194,7 +214,10 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                try:
+                    response = link.receive(RECEIPT_BUDGET_S)
+                except WorkerReceiptTimeout as exc:
+                    raise WorkerReceiptTimeout(method, exc.timeout, self.endpoint) from None
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()

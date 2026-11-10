@@ -36,6 +36,19 @@ _RESTART_CONTROL_REASONS = frozenset({'invalid_control_peer', 'incomplete_contro
 ADMISSION_ANSWER_MARGIN_S = 60.0
 
 
+class OwnerTransportUnavailable(Exception):
+    """No socket to the owner was ever opened, so the claim was never submitted.
+
+    Raised only for the connect phase; ``cause`` keeps the underlying error and its type for the
+    diagnostic, ``str()`` the quotable ``detail``. A failure after the socket is up (a refusal, a
+    lost answer) is never this: the owner may have admitted the attempt, and only its receipts can
+    say so."""
+
+    def __init__(self, cause, detail=None):
+        super().__init__(str(cause) if detail is None else detail)
+        self.cause = cause
+
+
 def admission_answer_budget():
     """Seconds to wait for ``kanban.run``'s answer: the longest the owner's admission write can
     wait on the board lock (``write_txn`` retries ``BEGIN IMMEDIATE`` ``_BUSY_MAX_RETRIES`` times,
@@ -56,6 +69,22 @@ class _Claim:
         return time.monotonic() - self.answered
 
 
+def is_owner_transport_failure(exc, *, submitted: bool) -> bool:
+    """The typed verdict behind ``OwnerTransportUnavailable``.
+
+    Transport = the connect phase failed with no answer from an owner: a missing/unready owner
+    (``GatewayUnavailableError``), a connection the client could not open (``connect_gateway``'s
+    ``GatewayClientError`` over ``OSError``/``TimeoutError``, or a failed handshake), or the raw
+    socket errors themselves. An owner's own reply (``GatewayRPCError``: permission, stale claim,
+    unknown method) is an application outcome, and anything after submission is uncertain: both
+    stay what they are."""
+    from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError
+    from websockets.exceptions import WebSocketException
+    if submitted or isinstance(exc, GatewayRPCError):
+        return False
+    return isinstance(exc, (GatewayClientError, WebSocketException, OSError, TimeoutError))
+
+
 async def run(params, board_db):
     from agent.retry_utils import jittered_backoff
     from hermes_cli.gateway_client import connect_gateway, GatewayClientError, outside_restart_wait
@@ -68,6 +97,7 @@ async def run(params, board_db):
     # worker, and one that stays silent for ``OWNER_WAIT_S`` fails the worker honestly.
     claim = _Claim(answered=time.monotonic())
     failures = 0
+    reached = False  # any socket to the owner opened, on any connection of this attempt
     while True:
         seen = claim.answered
         try:
@@ -76,6 +106,7 @@ async def run(params, board_db):
             # turn it waits on alive, holding `hermes update` until restart_after_turn_timeout.
             with outside_restart_wait():
                 async with connect_gateway() as client:
+                    reached = True
                     # kanban.run subscribes this socket to the card's session, but only receipts
                     # matter here: discard the turn's events, or they fill the client's bounded
                     # queue and its reader stops, with the next receipt behind it.
@@ -87,14 +118,18 @@ async def run(params, board_db):
         # A restart also surfaces as a refused or reset dial, a failed handshake, or an answer
         # that never came.
         except (GatewayClientError, WebSocketException, OSError, TimeoutError) as exc:
+            # Until a socket has opened nothing was submitted, so giving up is the host's condition,
+            # never the card's (``OwnerTransportUnavailable``); after that the attempt may be admitted.
+            unsent = is_owner_transport_failure(exc, submitted=reached)
             if not _restartable(exc):
+                if unsent:
+                    raise OwnerTransportUnavailable(exc, _quoted(exc)) from exc
                 raise
             if claim.silent_for() >= OWNER_WAIT_S:
-                # WebSocket errors can embed remote bodies; only our own messages are quoted.
-                status = getattr(getattr(exc, 'response', None), 'status_code', None)
-                detail = exc if isinstance(exc, GatewayClientError) else type(exc).__name__ + (
-                    f' (HTTP {status})' if status else '')
-                raise GatewayClientError(f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}') from exc
+                silent = f'Kanban owner silent for {claim.silent_for():.0f}s: {_quoted(exc)}'
+                if unsent:
+                    raise OwnerTransportUnavailable(exc, silent) from exc
+                raise GatewayClientError(silent) from exc
         else:
             return _exit_code(receipt, params, board_db)
         failures = 1 if claim.answered != seen else failures + 1
@@ -111,6 +146,15 @@ def _restartable(exc):
     if isinstance(exc, GatewayUnavailableError):
         return exc.state in _TRANSIENT_OWNER_STATES or exc.reason_code in _RESTART_CONTROL_REASONS
     return True
+
+
+def _quoted(exc):
+    """WebSocket errors can embed remote bodies; only our own messages are quoted."""
+    from hermes_cli.gateway_client import GatewayClientError
+    if isinstance(exc, GatewayClientError):
+        return str(exc)
+    status = getattr(getattr(exc, 'response', None), 'status_code', None)
+    return type(exc).__name__ + (f' (HTTP {status})' if status else '')
 
 
 async def _discard(events):
@@ -160,6 +204,37 @@ async def _receipt(client, claim):
     return await client.rpc('prompt.receipt', session_id=claim.session_id, admission_id=claim.admission_id)
 
 
+def record_owner_unavailable(board_db, params, exc) -> bool:
+    """Book the never-submitted attempt on the board, fenced to this exact run.
+
+    The same ``worker_result`` channel a managed interpreter uses, so the dispatcher's sweep reads
+    it through ``managed_run_exit_code`` under the run's claim and this process's pid, never from
+    a log tail that may belong to an earlier attempt. Written only while this run is still the
+    card's live ``running`` run under the same claim: a reclaimed card is somebody else's now.
+    False (and the exit code alone) when the board itself cannot be written."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    from hermes_cli.kanban_owner_recovery import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
+    cause = getattr(exc, 'cause', exc)
+    try:
+        with connect_closing(Path(board_db)) as conn, kb.write_txn(conn):
+            live = conn.execute(
+                "SELECT 1 FROM tasks WHERE id=? AND status='running' AND current_run_id=? AND claim_lock=?",
+                (params['task_id'], params['run_id'], params['claim_lock'])).fetchone()
+            if live is None:
+                return False
+            kb._append_event(conn, params['task_id'], 'worker_result', {
+                'pid': os.getpid(), 'claim_lock': params['claim_lock'],
+                'exit_code': KANBAN_OWNER_UNAVAILABLE_EXIT_CODE, 'last_output': '',
+                'infrastructure': True, 'error_type': type(cause).__name__, 'error': str(exc)[:300],
+            }, run_id=params['run_id'])
+        return True
+    except Exception as write_exc:  # health: allow BLE001 -- the exit code still carries the verdict
+        print(f'Kanban owner-unavailable receipt not written ({type(write_exc).__name__}): {write_exc}',
+              file=sys.stderr)
+        return False
+
+
 def main():
     # The dead-worker sweep books this process's exit from the trailer in its log (it never
     # reaps us), so every exit path writes it — the same contract as a quiet one-shot worker.
@@ -173,6 +248,7 @@ def main():
 
 
 def _submit():
+    params = board_db = None
     try:
         params = {'board': os.environ['HERMES_KANBAN_BOARD'], 'task_id': os.environ['HERMES_KANBAN_TASK'],
             'run_id': int(os.environ['HERMES_KANBAN_RUN_ID']), 'claim_lock': os.environ['HERMES_KANBAN_CLAIM_LOCK']}
@@ -185,8 +261,14 @@ def _submit():
         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
             os.environ.pop(key, None)
         return asyncio.run(run(params, board_db))
+    except OwnerTransportUnavailable as exc:
+        from hermes_cli.kanban_owner_recovery import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
+        print(f'Kanban owner unavailable ({type(exc.cause).__name__}): {exc}', file=sys.stderr)
+        record_owner_unavailable(board_db, params, exc)
+        return KANBAN_OWNER_UNAVAILABLE_EXIT_CODE
     except (KeyError, ValueError, OSError) as exc:
-        print(f'Kanban owner refused: {exc}', file=sys.stderr)
+        # The owner answered, or the answer is uncertain: the card's own outcome, never transient.
+        print(f'Kanban owner refused ({type(exc).__name__}): {exc}', file=sys.stderr)
         return 1
 
 
