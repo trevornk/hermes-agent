@@ -38,6 +38,7 @@ def defer_teardown_to_running_worker(
     and tear the agent down on completion; False when the caller must do it now."""
     if future is None or future.done():
         return False
+    from agent.memory_provider import ctx_bound
     from cron.scheduler import _finalize_cron_session, _teardown_cron_agent
 
     def _finish(_future) -> None:
@@ -48,8 +49,9 @@ def defer_teardown_to_running_worker(
         finally:
             _teardown_cron_agent(agent, job_id)
 
-    # Runs inline if the worker finished between done() and here — still exactly once.
-    future.add_done_callback(_finish)
+    # Future callbacks run after the worker exits ctx.run(), or inline if it just finished.
+    # Carry the registering owner's home and secret scope through either completion path.
+    future.add_done_callback(ctx_bound(_finish))
     return True
 
 
