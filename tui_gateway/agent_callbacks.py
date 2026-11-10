@@ -107,11 +107,11 @@ def _agent_presentation_enabled(sid: str, *, diagnostic: bool) -> bool:
         return warning_notifications_enabled("tui", getattr((session or {}).get("agent"), "_notification_config", None))
 
 
-def _agent_status_update(sid: str, kind: str, text: str | None = None) -> None:
+def _agent_status_update(sid: str, kind: str, text: str | None = None, *, category: str | None = None) -> None:
     from gateway.warning_notifications import is_warning_status
     if not _agent_presentation_enabled(sid, diagnostic=is_warning_status(kind, text if text is not None else kind)):
         return
-    _status_update(sid, str(kind), None if text is None else str(text))
+    _status_update(sid, str(kind), None if text is None else str(text), category=None if category is None else str(category))
 
 
 def _agent_thinking_update(sid: str, text: str) -> None:
@@ -161,7 +161,8 @@ def _agent_cbs(sid: str) -> dict:
         # Affection reaction (ily / <3 / good bot) → hearts; core-detected so TUI/desktop share it.
         "reaction_callback": lambda kind: _emit("reaction", sid, {"kind": kind}),
         "reasoning_callback": lambda text: _emit_reasoning_delta(sid, text),
-        "status_callback": lambda kind, text=None: _agent_status_update(sid, kind, text),
+        "status_callback": lambda kind, text=None, category=None: _agent_status_update(
+            sid, kind, text, category=category),
         # Credits/notice spine: AgentNotice → notification.show; recovery → notification.clear.
         "notice_callback": lambda n: _agent_notice_update(sid, n),
         "notice_clear_callback": lambda key: _emit("notification.clear", sid, {"key": key}),
