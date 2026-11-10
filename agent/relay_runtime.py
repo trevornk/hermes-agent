@@ -16,6 +16,7 @@ import tomllib
 import uuid
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
@@ -396,6 +397,14 @@ _PLUGIN_CONFIGURATION = _ProcessRelayPluginConfiguration()
 atexit.register(_PLUGIN_CONFIGURATION.retry_pending_cleanup)
 
 
+@dataclass(frozen=True)
+class _DeferredScopeResult:
+    """What a finished-but-unpopped scope closes with when the drain reclaims it."""
+
+    output: dict[str, Any]
+    ended_at: datetime | None = None
+
+
 class RelayRuntime:
     """Own Relay session scopes and the process plugin configuration."""
 
@@ -408,9 +417,10 @@ class RelayRuntime:
         self._subagent_parents: dict[str, str] = {}
         self._subagent_parent_handles: dict[str, Any] = {}
         self._execution_consumers: set[str] = set()
-        # Outputs of scopes that finished under a concurrent scope (pop_relay_scope_if_top said no),
-        # keyed by handle uuid: the drain that later reclaims the scope closes it with this output.
-        self._deferred_scope_outputs: dict[str, dict[str, Any]] = {}
+        # Results of scopes that finished under a concurrent scope (pop_relay_scope_if_top said no),
+        # keyed by handle uuid: the drain that later reclaims the scope closes it with this output
+        # and the time the call actually finished.
+        self._deferred_scope_outputs: dict[str, _DeferredScopeResult] = {}
         self._deferred_scope_outputs_lock = threading.Lock()
         self._closing = self._shutdown_started = False
         self._shutdown_complete, self._operations_idle = threading.Event(), threading.Event()
@@ -426,15 +436,17 @@ class RelayRuntime:
     def _plugins_active(self) -> bool:
         return self._plugin_configuration_state is _RelayPluginConfigurationState.ACTIVE
 
-    def defer_scope_output(self, handle: Any, output: dict[str, Any]) -> None:
-        """Keep the real output of a finished scope that could not be popped yet because a
-        concurrent scope sits above it; the orphan drain closes it with this instead."""
+    def defer_scope_output(self, handle: Any, output: dict[str, Any], ended_at: datetime | None = None) -> None:
+        """Keep the real result of a finished scope that could not be popped yet because a
+        concurrent scope sits above it; the drain closes it with this instead of as an orphan.
+        ``ended_at`` (timezone-aware) is when the call finished: without it the scope would end
+        at drain time, stretching its span to the whole turn."""
         key = getattr(handle, "uuid", None)
         if key is not None:
             with self._deferred_scope_outputs_lock:
-                self._deferred_scope_outputs[str(key)] = output
+                self._deferred_scope_outputs[str(key)] = _DeferredScopeResult(output, ended_at)
 
-    def _take_deferred_scope_output(self, handle: Any) -> dict[str, Any] | None:
+    def _take_deferred_scope_output(self, handle: Any) -> _DeferredScopeResult | None:
         key = getattr(handle, "uuid", None)
         if key is None:
             return None
@@ -719,7 +731,7 @@ class RelayRuntime:
         with contextlib.suppress(Exception):
             pop_relay_scope(self.relay, handle, output=output, metadata=metadata)
             return None
-        drained = 0
+        deferred = orphaned = 0
         for _ in range(drain_limit):
             top = _current_top(self.relay)
             if top is None or _same_handle(top, handle):
@@ -728,16 +740,31 @@ class RelayRuntime:
             if session_root is not None and _same_handle(top, session_root) and handle is not session_root:
                 break
             try:
-                orphan_output = self._take_deferred_scope_output(top) or {
-                    "outcome": "cancelled", "hermes.orphan_drain": True,
-                }
-                pop_relay_scope(self.relay, top, output=orphan_output, metadata=metadata)
-                drained += 1
+                # A scope with a stored result completed normally and only could not be popped
+                # (a concurrent scope sat above it): close it as it ended. Only one that never
+                # completed (interrupt mid-call, abandoned stream) is a true orphan.
+                completed = self._take_deferred_scope_output(top)
+                if completed is not None:
+                    pop_relay_scope(
+                        self.relay, top, output=completed.output, metadata=metadata, timestamp=completed.ended_at,
+                    )
+                    deferred += 1
+                else:
+                    pop_relay_scope(
+                        self.relay, top, output={"outcome": "cancelled", "hermes.orphan_drain": True},
+                        metadata=metadata,
+                    )
+                    orphaned += 1
             except Exception:
                 logger.warning("Hermes Relay orphaned scope drain failed", exc_info=True)
                 break
-        if drained:
-            logger.warning("Hermes Relay drained %d orphaned scope(s) before closing %s", drained, handle)
+        if deferred:
+            logger.debug(
+                "Hermes Relay closed %d deferred scope(s) at their recorded end time before closing %s",
+                deferred, handle,
+            )
+        if orphaned:
+            logger.warning("Hermes Relay drained %d orphaned scope(s) before closing %s", orphaned, handle)
         try:
             pop_relay_scope(self.relay, handle, output=output, metadata=metadata)
             return None
