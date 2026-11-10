@@ -257,19 +257,53 @@ def enabled_plugin_entries(*, proposed_home=None, enabled=None, disabled=None,
 
     The key is what the home's config names, so a caller can edit that home's selection.
     """
-    from pm.plugins_state import enabled_plugins_ordered
+    from pm.plugins_state import _is_directory, enabled_plugins_ordered
 
     selection = enabled_plugins_ordered(
         proposed_home=proposed_home, enabled=enabled, disabled=disabled, installing=installing,
         skip_invalid_secondary=skip_invalid_secondary,
     )
     entries = []
+    if not selection:
+        return entries
+    from hermes_cli.plugins_manifest import manifest_key
+    from pm.manifest_selection import BUNDLED_PROVIDER_DIRS, directory_manifests, winning_manifests
+    from pm.plugins_state import read_home_selection
+
+    bundled_root = paths.repo_root() / "plugins"
+    bundled = directory_manifests(bundled_root, "bundled")
     for plugins_dir, names in selection.items():
+        home = plugins_dir.parent
+        config = read_home_selection(home) or {}
+        denied = set((config.get("plugins") or {}).get("disabled") or ())
+        if proposed_home is not None and home.resolve() == Path(proposed_home).resolve():
+            denied = set(disabled or ())
+        manifests = winning_manifests(bundled, plugins_dir)
         for name in names:
-            plugin_dir = selected_plugin_dir(plugins_dir, name, installing=installing)
-            if plugin_dir is not None:
+            relative = Path(name)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise InstallError("venv", f"invalid plugin key: {name}")
+            matches = [m for m in manifests if name in {manifest_key(m), m.name}]
+            if matches:
+                entries.extend((plugins_dir, name, Path(m.path)) for m in matches
+                               if not {manifest_key(m), m.name} & denied)
+                continue
+            # Preserve package-only and category-owned provider declarations,
+            # and admission's not-yet-published destination. A manifest-bearing
+            # directory is NOT an alias unless discovery actually accepts it.
+            plugin_dir = plugins_dir / relative
+            proposed = installing is not None and plugin_dir.resolve() == installing.resolve()
+            if not proposed and not _is_directory(plugin_dir):
+                plugin_dir = bundled_root / relative
+            if proposed:
                 entries.append((plugins_dir, name, plugin_dir))
-    return entries
+            elif _is_directory(plugin_dir):
+                read_python_declaration(plugin_dir)  # validates; a malformed declaration fails enumeration closed
+                has_manifest = any((plugin_dir / f).exists() for f in ("plugin.yaml", "plugin.yml", "plugin.json"))
+                provider = plugin_dir.is_relative_to(bundled_root) and relative.parts[0] in BUNDLED_PROVIDER_DIRS
+                if (not has_manifest or provider) and name not in denied:
+                    entries.append((plugins_dir, name, plugin_dir))
+    return list(dict.fromkeys(entries))
 
 
 def selected_plugin_dir(plugins_dir: Path, name: str, *, installing: Path | None = None) -> Path | None:
