@@ -50,6 +50,7 @@ from tools.cronjob_job_args import (
     _format_job,
     _gateway_liveness_notice,
     _local_delivery_notice,
+    _local_delivery_resolution_notice,
     _mode_guidance_notes,
     _normalize_deliver_param,
     _normalize_optional_job_value,
@@ -662,11 +663,24 @@ def _try_dispatch_background_run(
 # job record for job-bound actions) and returns the JSON result string.
 # ---------------------------------------------------------------------------
 
-def _with_guidance(result: dict[str, Any], job: dict[str, Any], deliver: Optional[str]) -> dict[str, Any]:
+def _with_guidance(
+    result: dict[str, Any], job: dict[str, Any], deliver: Optional[str],
+    args: dict[str, Any], *, created: bool = False,
+) -> dict[str, Any]:
     """Attach mode/delivery guidance (create and update echo the same notes)."""
     _notes = _mode_guidance_notes(job, deliver)
     if _notes:
         result["guidance"] = _notes
+    delivery_notice = _local_delivery_resolution_notice({
+        key: _normalize_deliver_param(args[key])
+        for key in ("deliver", "failure_deliver") if args[key] or (created and key == "deliver")
+    })
+    if delivery_notice:
+        result["delivery_resolved"] = delivery_notice
+    elif created:
+        notice = _local_delivery_notice(job, deliver)
+        if notice:
+            result["message"] += f" {notice}"
     return result
 
 
@@ -730,7 +744,8 @@ def _action_create(a: dict[str, Any]) -> str:
             timezone=_normalize_optional_job_value(a["timezone"]),
             grace_minutes=a["grace_minutes"],
             pinned=bool(a["pinned"]),
-            failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
+            failure_deliver=_resolve_cron_context_deliver(
+                _normalize_deliver_param(a["failure_deliver"]), resolve_omitted=False),
             catch_up=a["catch_up"],
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
@@ -738,8 +753,7 @@ def _action_create(a: dict[str, Any]) -> str:
         _partial = exc.to_dict()
         return tool_error(_partial.pop("error"), success=False, **_partial)
     _create_message = " ".join(filter(None, (f"Cron job '{job['name']}' created.",
-        "Created PAUSED — resume to schedule, or explicitly run now." if not job.get("enabled", True) else None,
-        _local_delivery_notice(job, deliver))))
+        "Created PAUSED — resume to schedule, or explicitly run now." if not job.get("enabled", True) else None)))
     # The builtin ticker lives in the gateway process: with no gateway running the job is stored
     # but never fires — tell the model (the CLI already warns).
     _result = {
@@ -748,7 +762,7 @@ def _action_create(a: dict[str, Any]) -> str:
         "deliver": job.get("deliver", "local"), "next_run_at": job["next_run_at"], "job": _format_job(job),
         "message": _create_message, **_gateway_liveness_notice(),
     }
-    return _dumps(_with_guidance(_result, job, deliver))
+    return _dumps(_with_guidance(_result, job, deliver, a, created=True))
 
 
 def _action_list(a: dict[str, Any]) -> str:
@@ -999,7 +1013,8 @@ def _action_update(job: dict[str, Any], a: dict[str, Any]) -> str:
     _notify_provider_jobs_changed_safe()
     # An update can switch modes or delivery — echo the same guidance as create.
     return _dumps(_with_guidance(
-        {"success": True, "job": _format_job(updated)}, updated, _normalize_deliver_param(a["deliver"])))
+        {"success": True, "job": _format_job(updated)}, updated, _normalize_deliver_param(a["deliver"]),
+        a))
 
 
 _JOBLESS_ACTIONS = {"create": _action_create, "list": _action_list}
