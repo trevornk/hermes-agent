@@ -21,6 +21,11 @@ _PLUGIN_STATE_LOCKS: dict[str, threading.RLock] = {}
 _PLUGIN_STATE_LOCKS_GUARD = threading.Lock()
 
 
+def _plugin_toolset_keys_cache_path() -> Path:
+    """Last launch's discovered toolset keys + portable MCP names, read by the ``*_nowait`` probes."""
+    return get_hermes_home() / "cache" / "plugin_toolset_keys.json"
+
+
 def _plugin_relative_segments(key: str) -> tuple[str, ...]:
     """Validate/split a plugin-relative settings key; global paths, traversal, and core roots are rejected
     before any config read.
