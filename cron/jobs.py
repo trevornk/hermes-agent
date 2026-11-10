@@ -2591,6 +2591,10 @@ def claim_dispatch(job_id: str) -> bool:
         completed = repeat.get("completed", 0)
         label = job.get("name", job.get("id", "?"))
         if completed >= times:
+            from cron.jobs_ownership import oneshot_run_inflight
+
+            if oneshot_run_inflight(job, _hermes_now()):
+                return False
             if job.get("last_run_at") is not None:
                 # A prior run completed normally (mark_job_run raced this tick). Retain the terminal
                 # record, as mark_job_run's repeat-limit branch does, instead of deleting the
@@ -3117,23 +3121,19 @@ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool
     """One-shot dispatch-limit guard; True when the job must not fire this tick.
 
     A finite one-shot claimed via claim_dispatch() whose tick died before mark_job_run has
-    completed >= times while still looking due. Remove it instead of re-firing — unless THIS
-    process is still running it (a run outliving the run_claim TTL is slow, not stale)."""
+    completed >= times while still looking due. Retire only after local and durable foreign
+    ownership have ended; the running owner still needs the record for mark_job_run."""
     repeat = job.get("repeat") or {}
     times = repeat.get("times")
     completed = repeat.get("completed", 0)
     if times is None or times <= 0 or completed < times:
         return False
     name = job.get("name", job.get("id", "?"))
-    # A live run must never have its job record deleted underneath it (#62002): a run that outlives the
-    # run_claim TTL (stream stall, laptop asleep mid-run) satisfies the same completed >= times +
-    # expired-claim condition as a dead tick, but mark_job_run() still needs the record to land last_run_at
-    # / last_status / last_delivery_error. If this process is still running the job, it is slow, not stale —
-    # keep the entry and skip.
-    if _job_running_in_this_process(job.get("id", "")):
+    from cron.jobs_ownership import oneshot_run_inflight
+
+    if oneshot_run_inflight(job, scan.now):
         logger.info(
-            "Job '%s': dispatch limit reached (%d/%d) but its run is still in flight in this "
-            "process — keeping entry",
+            "Job '%s': dispatch limit reached (%d/%d) but its run is still in flight — keeping entry",
             name, completed, times)
         return True
     if job.get("last_run_at") is not None:
