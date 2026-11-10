@@ -521,7 +521,9 @@ with open(path, "rb") as audio:
 
 - **No API-key fallback.** Without the sign-in you get `ProviderNotSignedIn`
   even when `XAI_API_KEY` is set, so a plugin never bills the API key by
-  surprise.
+  surprise. A configured sign-in that cannot be resolved or refreshed raises
+  `ProviderRequestNotSent`, not `ProviderNotSignedIn`; plugins must not fall back
+  to an API key after that failure.
 - **No caller credentials.** A URL with `user:password@`, or an
   `Authorization`, `Proxy-Authorization`, `Cookie` or `Host` header, raises
   `PermissionError` before the sign-in is read.

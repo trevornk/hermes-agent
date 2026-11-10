@@ -131,16 +131,17 @@ def test_capabilities_need_no_sign_in(monkeypatch):
 
 def test_multipart_upload_carries_each_profiles_own_sign_in(xai, tmp_path, monkeypatch):
     allowed, _ = xai
+    tokens = {profile: _token(profile) for profile in ("work", "home")}
     for profile in ("work", "home"):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / profile))
         _home().mkdir()
-        _sign_in(_token(profile))
+        _sign_in(tokens[profile])
         result = _plugin().send(allowed.url + "/v1/stt", **_form())
         assert result.status == 200 and result.json() == {"text": "synthetic"}
-        assert _token(profile).split(".")[1] not in repr(result)
+        assert tokens[profile].split(".")[1] not in repr(result)
 
     for seen, profile in zip(allowed.seen, ("work", "home")):
-        assert seen["headers"]["Authorization"].split(".")[1] == _token(profile).split(".")[1]
+        assert seen["headers"]["Authorization"].split(".")[1] == tokens[profile].split(".")[1]
         assert seen["headers"]["Content-Type"].startswith("multipart/form-data; boundary=")
         body = seen["body"]
         assert body.index(b'name="model"') < body.index(b'name="diarize"') < body.index(b'name="file"')
@@ -274,3 +275,27 @@ def test_codex_keeps_its_original_error_and_header_contract(monkeypatch):
                         (origins, lambda url: ({"Authorization": "Bearer core-token"}, "https://chatgpt.com")))
     with pytest.raises(httpx.ConnectError):
         plugin.send(allowed.url, provider="openai-codex", json={})
+
+
+@pytest.mark.parametrize("selection_error", [None, RuntimeError("private refresh failure")])
+def test_configured_sign_in_resolution_failure_is_not_missing_sign_in(xai, monkeypatch, selection_error):
+    """A failed/unavailable pool must not authorize a plugin's paid API-key fallback."""
+    from agent.credential_pool import CredentialPool
+    from hermes_cli.config import invalidate_env_cache
+
+    allowed, _ = xai
+    _sign_in(_token("configured-user"))
+    monkeypatch.setenv("XAI_API_KEY", "paid-api-key-sentinel")
+    invalidate_env_cache()
+
+    def unavailable(self, **kwargs):
+        if selection_error is not None:
+            raise selection_error
+
+    monkeypatch.setattr(CredentialPool, "select", unavailable)
+    with pytest.raises(ppr.ProviderRequestNotSent, match="was not sent") as raised:
+        _plugin().send(allowed.url, json={"expires_after": {"seconds": 300}})
+    assert "private refresh failure" not in str(raised.value)
+    assert "paid-api-key-sentinel" not in str(raised.value)
+    assert not isinstance(raised.value, ppr.ProviderNotSignedIn)
+    assert allowed.seen == []
