@@ -92,6 +92,9 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    schedule_elapsed: list[str] = field(default_factory=list)
+    """``scheduled`` cards released this tick because their
+    ``SCHEDULED_UNTIL`` marker passed."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -2402,6 +2405,14 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
+    if not dry_run:
+        # Wake time-parked cards before enumerating ready rows so a card
+        # released here can spawn in this same tick.
+        try:
+            result.schedule_elapsed = _kb.release_elapsed_schedules(conn)
+        except sqlite3.Error:
+            import logging
+            logging.getLogger(__name__).exception("kanban: schedule release sweep failed")
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )

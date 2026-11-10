@@ -4028,6 +4028,56 @@ def schedule_task(
         return True
 
 
+_SCHEDULED_UNTIL_RE = re.compile(r"SCHEDULED_UNTIL=(\S+)")
+
+
+def parse_scheduled_until(reason: Optional[str]) -> Optional[int]:
+    """Epoch seconds of the first ``SCHEDULED_UNTIL=<ISO8601 with offset>``
+    marker in a park reason, or ``None``. Fails closed: no marker, an
+    unparseable value or a naive (offset-less) timestamp all return ``None``."""
+    if not reason:
+        return None
+    match = _SCHEDULED_UNTIL_RE.search(reason)
+    if match is None:
+        return None
+    from datetime import datetime
+    try:
+        parsed = datetime.fromisoformat(match.group(1).rstrip(".,;:)]}'\"`"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return int(parsed.timestamp())
+
+
+def release_elapsed_schedules(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
+    """Release ``scheduled`` cards whose newest ``scheduled`` event carries a
+    ``SCHEDULED_UNTIL`` marker that has passed, via :func:`unblock_task` (parent
+    gating, events and the dispatcher's run-outcome rules apply unchanged), and
+    record a ``schedule_elapsed`` event. Cards without a valid marker stay
+    parked for an orchestrator. Idempotent: a released card is no longer
+    ``scheduled``."""
+    now = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        "SELECT t.id AS id, (SELECT e.payload FROM task_events e "
+        "WHERE e.task_id = t.id AND e.kind = 'scheduled' "
+        "ORDER BY e.id DESC LIMIT 1) AS payload "
+        "FROM tasks t WHERE t.status = 'scheduled'"
+    ).fetchall()
+    released: list[str] = []
+    for row in rows:
+        reason = _json_dict(row["payload"]).get("reason")
+        until = parse_scheduled_until(reason if isinstance(reason, str) else None)
+        if until is None or until > now:
+            continue
+        if not unblock_task(conn, row["id"]):
+            continue
+        with write_txn(conn):
+            _append_event(conn, row["id"], "schedule_elapsed", {"until": until})
+        released.append(row["id"])
+    return released
+
+
 # --- Worker context builder (what a spawned worker sees) ---
 
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
