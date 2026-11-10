@@ -916,6 +916,20 @@ def _cleanup_invalid_pid_path(
     already have opened that inode, and a fresh one would let two processes each hold "the" lock."""
     if not cleanup_stale:
         return
+    # [carried, gateway_false_down_crossprofile.patch] A live lock normally means the files
+    # are NOT stale (restart window: a new gateway won the lock but has not rewritten the pid
+    # record yet), so leave them alone. The exception: a persisted record naming a DIFFERENT
+    # hermes home is provably poison (#89315) -- a real gateway for THIS home never writes
+    # another home's path, so the restart-window rationale cannot apply. Only the PID record
+    # decides "poison"; the lock record must NOT vote, because during the pre-write window it
+    # still holds the PREVIOUS owner's bytes.
+    _lock_path = _get_gateway_lock_path(pid_path)
+    _lock_active = is_gateway_runtime_lock_active(_lock_path)
+    _foreign_pid_record = recorded_gateway_home_conflicts(
+        _read_pid_record(pid_path), expected_home=pid_path.parent
+    )
+    if _lock_active and not _foreign_pid_record:
+        return
     _clear_running_pid_cache()
     # Keep the inode even when stale: another contender may already have opened it.
     for path in (pid_path,):
