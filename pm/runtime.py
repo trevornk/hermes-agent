@@ -191,12 +191,13 @@ def collect_runtime_generations(root: Path) -> list[Path]:
     existed stay, as the application collector keeps its own.
     """
     from pm.filesystem import lock_fd
+    from pm.outer_transaction import active
     from hermes_cli.runtime_state import leases_held
 
     generations = root / "generations"
     removed: list[Path] = []
-    if not generations.is_dir():
-        return removed
+    if not generations.is_dir() or active():
+        return removed  # an outer safe-update's rollback still guards the retained runtimes
     with (root / ".prepare.lock").open("a+b") as lock:
         if not lock_fd(lock.fileno(), wait=False):
             return removed  # a stage is in flight; maintenance skips rather than queues

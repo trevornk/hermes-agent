@@ -139,6 +139,9 @@ def collect_superseded_generations(project_root: Path) -> None:
     """
     import logging
 
+    from pm.outer_transaction import active
+    if active():
+        return  # The outer rollback still owns the old selections/generations.
     from hermes_cli.runtime_state import collect_generations
     from pm.environments import install_state_dir
     from pm.runtime import collect_runtime_generations
@@ -180,7 +183,8 @@ def arm_completion(project_root: Path) -> Path:
     """Persist the tail obligation before selecting a new dependency generation."""
     pending = completion_pending_path(project_root)
     pending.parent.mkdir(parents=True, exist_ok=True)
-    pending.write_text("source update tail not finished\n", encoding="utf-8")
+    from pm.filesystem import durable_write_bytes
+    durable_write_bytes(pending, b"source update tail not finished\n")
     return pending
 
 
@@ -236,8 +240,9 @@ def _record_completion_attempt(root: Path, *, failed: bool, inputs: str | None =
     the failures before it were for other inputs.
     """
     record = _completion_attempts_path(root)
+    from pm.outer_transaction import unlink
     if not failed:
-        record.unlink(missing_ok=True)
+        unlink(record)
         return
     try:
         attempts, recorded = _read_completion_attempts(record)
@@ -246,7 +251,8 @@ def _record_completion_attempt(root: Path, *, failed: bool, inputs: str | None =
     if inputs is not None and recorded is not None and recorded != inputs:
         attempts = 0
     try:
-        record.write_text(f"{attempts + 1}\n" + (f"{inputs}\n" if inputs else ""), encoding="utf-8")
+        from pm.filesystem import durable_write_bytes
+        durable_write_bytes(record, (f"{attempts + 1}\n" + (f"{inputs}\n" if inputs else "")).encode())
     except OSError:
         pass  # a read-only install state degrades to unbounded retries, never blocks boot
 
@@ -287,8 +293,9 @@ def completion_retry_state(project_root: Path, *, now=None) -> tuple[bool, int, 
 
 
 def clear_completion(root: Path) -> None:
-    completion_pending_path(root).unlink(missing_ok=True)
-    _completion_attempts_path(root).unlink(missing_ok=True)
+    from pm.outer_transaction import unlink
+    unlink(completion_pending_path(root))
+    unlink(_completion_attempts_path(root))
 
 
 def refuse_foreign_owned_venv(project_root: Path) -> None:

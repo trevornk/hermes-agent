@@ -29,6 +29,8 @@ def _pull_plugin_update(target: Path, pinned_msg, not_git_msg, before_pull=None,
     scan the candidate tree the same way: *force* or a truthy *scan_decision_cb* accepts a caution
     verdict, nothing accepts a dangerous one. *surface_gate(manifest, tree)* may refuse the candidate
     before publication (unattended updates: :func:`~hermes_cli.plugins_auto_update.unattended_gate`)."""
+    from pm.outer_transaction import refuse_plugin_swap
+    refuse_plugin_swap()
     metadata = _pc()._read_install_metadata()
     install_record = metadata.get(target.name, {})
     if install_record.get("pinned") is True:
