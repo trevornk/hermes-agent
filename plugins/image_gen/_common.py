@@ -41,6 +41,28 @@ GPT_IMAGE_2_TIERS: dict[str, dict[str, Any]] = {
     },
 }
 
+# GPT Image 2.5 (Sep 2026): two API models sharing gpt-image-2's token pricing. Flare is the
+# fast default; Sunburst trades latency for precision across edits. Each exposes the full
+# quality ladder, with the bare id meaning ``quality=auto`` (the model picks).
+# [carried, codex_image_gen_25.patch] Single source of truth so the openai and openai-codex
+# backends cannot drift on which 2.5 variants/qualities are offered.
+GPT_IMAGE_25_VARIANTS: tuple[tuple[str, str, str, str], ...] = (
+    ("gpt-image-2.5-flare", "Flare", "Fast", "Everyday image generation and editing"),
+    ("gpt-image-2.5-sunburst", "Sunburst", "Slower", "Precision generation and editing"),
+)
+GPT_IMAGE_25_QUALITIES: tuple[str, ...] = ("auto", "low", "medium", "high", "xhigh", "max")
+GPT_IMAGE_25_TIERS: dict[str, dict[str, Any]] = {
+    (model if quality == "auto" else f"{model}-{quality}"): {
+        "display": f"GPT Image 2.5 {name} ({quality.title()})",
+        "speed": speed,
+        "strengths": strengths,
+        "api_model": model,
+        "quality": quality,
+    }
+    for model, name, speed, strengths in GPT_IMAGE_25_VARIANTS
+    for quality in GPT_IMAGE_25_QUALITIES
+}
+
 PROMPT_REQUIRED = "Prompt is required and must be a non-empty string"
 OPENAI_MISSING = "openai Python package not installed (pip install openai)"
 
