@@ -113,6 +113,9 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
+# Board-UI/human identities: Desktop uses desktop, the dashboard defaults to
+# dashboard, and trev is the human chore assignee. Profile names are agents.
+HUMAN_COMMENT_AUTHORS = frozenset({"desktop", "dashboard", "trev", "trevor"})
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -3215,6 +3218,7 @@ def block_task(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
             triage_round_trips=triage_round_trips(conn, task_id),
+            human_replied=_human_replied_since_last_block(conn, task_id),
         )
         if rekind_reason:
             payload["requested_kind"] = requested_kind
@@ -3244,9 +3248,31 @@ def block_task(
     return True
 
 
+def _human_replied_since_last_block(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether a board human commented after this task's newest block routing event."""
+    placeholders = ",".join("?" * len(BLOCK_ROUTING_EVENT_KINDS))
+    row = conn.execute(
+        f"SELECT id FROM task_events WHERE task_id = ? "
+        f"AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+        (task_id, *BLOCK_ROUTING_EVENT_KINDS),
+    ).fetchone()
+    if row is None:
+        return False
+    comments = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ?",
+        (task_id, row["id"]),
+    )
+    return any(
+        str((_json_or(_lossy_text(comment["payload"])) or {}).get("author", "")).strip().lower()
+        in HUMAN_COMMENT_AUTHORS
+        for comment in comments
+    )
+
+
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
     prev_kind: Optional[str], prev_recurrences: int, triage_round_trips: int = 0,
+    human_replied: bool = False,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -3258,7 +3284,8 @@ def _route_block(
     recurrences: block_task only fires from running/ready (AFTER an unblock
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
-    (un-typed None compares equal to a prior un-typed block). At
+    (un-typed None compares equal to a prior un-typed block). A
+    human reply since the last block restarts the count at 1. At
     ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
     ``triage_round_trips`` is read from the card's own escalation history (see
     :func:`triage_round_trips`) and lands on the ``block_loop_detected`` payload, so
@@ -3267,9 +3294,11 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
-    recurrences = prev_recurrences + 1 if prev_kind == kind else 1
+    recurrences = 1 if human_replied else (prev_recurrences + 1 if prev_kind == kind else 1)
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
+    if human_replied:
+        payload["human_reply_reset"] = True
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
         # ``recurrences`` alone reads as N consecutive honest blocks. Record how many
