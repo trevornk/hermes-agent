@@ -11,6 +11,19 @@ import sqlite3
 from hermes_state_runtime import RuntimeStoreError
 
 
+def _worker_default_model(config) -> tuple:
+    """``kanban.worker_model`` / ``worker_provider`` for a card with no per-card override.
+
+    Unset (the default) keeps the assigned profile's own model, so a profile whose main slot is the
+    planner model does not run every well-specified card on it."""
+    section = config.get('kanban') if isinstance(config, dict) else None
+    section = section if isinstance(section, dict) else {}
+    model = str(section.get('worker_model') or '').strip()
+    if not model:
+        return None, None
+    return model, (str(section.get('worker_provider') or '').strip() or None)
+
+
 def build_kanban_policy(connection, params, config):
     from hermes_cli import kanban_db as kb
     from hermes_cli.profiles import resolve_profile_env
@@ -42,6 +55,11 @@ def build_kanban_policy(connection, params, config):
             if bound and json.loads(bound[0])['request_id'] != 'kanban:' + json.dumps([board, task.id, task.current_run_id], separators=(',', ':')):
                 raise RuntimeStoreError('stale_kanban_claim')
             context = kb.build_worker_context(conn, task.id)
+            # kanban.worker_model: a decomposition root (the card that judges its fanned-out children) keeps
+            # the profile model; only plain cards without a per-card override take the worker default.
+            decomposition_root = bool(task.model_override) or conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' LIMIT 1", (task.id,),
+            ).fetchone() is not None
             skills = list(task.skills or ())
             if kb._retry_status_for_run(conn, task.id, task.current_run_id) == 'review':
                 # Same rule as the dispatcher's review lane: the reviewer always loads sdlc-review.
@@ -50,7 +68,10 @@ def build_kanban_policy(connection, params, config):
         raise RuntimeStoreError('invalid_kanban_claim') from exc
     cwd = task.workspace_path
     params_policy = {'source': 'cli', 'cwd': cwd}
-    for name, value in (('model', task.model_override), ('provider', task.provider_override), ('reasoning', task.reasoning_effort)):
+    model, provider = task.model_override, task.provider_override
+    if not model and not decomposition_root:
+        model, provider = _worker_default_model(config)
+    for name, value in (('model', model), ('provider', provider), ('reasoning', task.reasoning_effort)):
         if value:
             params_policy[name] = value
     private = {}
