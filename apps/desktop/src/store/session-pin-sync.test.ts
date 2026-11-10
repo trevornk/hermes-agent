@@ -13,6 +13,7 @@ vi.mock('@/hermes', () => ({
   setSessionPinnedRemote: (id: string, pinned: boolean, profile?: null | string) => patch(id, pinned, profile)
 }))
 
+import { rescopeConnectionScopedStores } from '@/lib/connection-scoped'
 import { $pinnedSessionIds } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $cronSessions, $messagingSessions, $sessions, applySessionTitle, touchSessionActivity } from '@/store/session'
@@ -40,6 +41,8 @@ beforeEach(() => {
   // bookkeeping would otherwise suppress the next test's PATCH (or fence out
   // its page). Same reset the gateway switch uses.
   resetSessionPinMirror()
+  // Hydrate an empty cache; subsequent changes in these tests are user intent.
+  $sessions.set([])
   patch.mockClear()
 })
 
@@ -48,6 +51,91 @@ afterEach(() => {
   $cronSessions.set([])
   $messagingSessions.set([])
   $pinnedSessionIds.set([])
+})
+
+describe('watchSessionPins cached pins', () => {
+  // Reset to the same unhydrated state watchSessionPins starts with at boot.
+  it.each([false, true])('adopts pinned=%s for a boot cache without PATCHing', async pinned => {
+    resetSessionPinMirror()
+    $pinnedSessionIds.set(['a'])
+    $sessions.set([row('a', { pinned })])
+    await flush()
+
+    expect(patch).not.toHaveBeenCalled()
+    expect($pinnedSessionIds.get()).toEqual(pinned ? ['a'] : [])
+    expect($unconfirmedPinWrites.get().size).toBe(0)
+  })
+
+  it('treats stale pins reloaded by a connection rescope as cache', async () => {
+    const baseUrl = 'https://pin-cache.test'
+    const key = `hermes.desktop.pinnedSessions.remote.${encodeURIComponent(baseUrl)}`
+    window.localStorage.setItem(key, JSON.stringify(['a']))
+
+    try {
+      rescopeConnectionScopedStores({ mode: 'remote', baseUrl })
+      $sessions.set([row('a', { pinned: false })])
+      await flush()
+
+      expect(patch).not.toHaveBeenCalled()
+      expect($pinnedSessionIds.get()).toEqual([])
+    } finally {
+      $sessions.set([])
+      rescopeConnectionScopedStores({ mode: 'local' })
+      window.localStorage.removeItem(key)
+    }
+  })
+
+  it('still pushes user pins and unpins after confirming a cached pin', async () => {
+    resetSessionPinMirror()
+    $pinnedSessionIds.set(['a'])
+    $sessions.set([row('a', { pinned: true }), row('b', { pinned: false })])
+    await flush()
+    expect(patch).not.toHaveBeenCalled()
+
+    $pinnedSessionIds.set(['a', 'b'])
+    await flush()
+    expect(patch).toHaveBeenCalledWith('b', true, undefined)
+
+    $pinnedSessionIds.set(['b'])
+    await flush()
+    expect(patch).toHaveBeenCalledWith('a', false, undefined)
+    expect(patch).toHaveBeenCalledTimes(2)
+  })
+
+  it('leaves a rowless cached pin local across unrelated refreshes', async () => {
+    resetSessionPinMirror()
+    $pinnedSessionIds.set(['missing'])
+    $sessions.set([row('other', { pinned: false })])
+    await flush()
+    $cronSessions.set([row('job')])
+    await flush()
+
+    expect(patch).not.toHaveBeenCalled()
+    expect($pinnedSessionIds.get()).toEqual(['missing'])
+  })
+
+  it('does not migrate cached pins on a flagless backend', async () => {
+    resetSessionPinMirror()
+    $pinnedSessionIds.set(['legacy'])
+    $sessions.set([row('legacy')])
+    await flush()
+
+    expect(patch).not.toHaveBeenCalled()
+    expect($pinnedSessionIds.get()).toEqual(['legacy'])
+  })
+
+  it('drops an unconfirmed cached pin locally, then pushes an explicit re-pin', async () => {
+    resetSessionPinMirror()
+    $pinnedSessionIds.set(['a'])
+    $sessions.set([row('a')])
+    $pinnedSessionIds.set([])
+    await flush()
+    expect(patch).not.toHaveBeenCalled()
+
+    $pinnedSessionIds.set(['a'])
+    await flush()
+    expect(patch).toHaveBeenCalledWith('a', true, undefined)
+  })
 })
 
 describe('watchSessionPins', () => {
