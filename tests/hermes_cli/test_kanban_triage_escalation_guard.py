@@ -44,7 +44,7 @@ def _claim_running(conn, tid: str) -> None:
     assert kb.claim_task(conn, tid, claimer="worker") is not None
 
 
-def _park_in_triage(conn, *, kind: str = "needs_input", title: str = "looping card") -> str:
+def _park_in_triage(conn, *, kind: str = "transient", title: str = "looping card") -> str:
     """Drive a card through the REAL ladder until the breaker parks it in ``triage``."""
     tid = kb.create_task(conn, title=title, assignee="worker")
     _claim_running(conn, tid)
@@ -340,7 +340,7 @@ def test_re_escalated_card_reports_its_round_trip(kanban_home: Path) -> None:
         tid = _park_in_triage(conn)
         _escape_triage_by_hand(conn, tid)
         _claim_running(conn, tid)
-        kb.block_task(conn, tid, reason="same cause", kind="needs_input")
+        kb.block_task(conn, tid, reason="same cause", kind="transient")
 
         escalations = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"]
         assert len(escalations) == 2
@@ -363,7 +363,7 @@ def test_re_escalated_card_reports_its_round_trip(kanban_home: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def _park_decomposed_root(conn) -> str:
-    """A root that fanned out once, then blocked needs_input to the breaker's limit."""
+    """A root that fanned out once, then blocked transient to the breaker's limit."""
     tid = kb.create_task(conn, title="already-decomposed root", triage=True)
     child_ids = kbg.decompose_triage_task(
         conn, tid, root_assignee="worker", children=_children(), author="decomposer",
@@ -377,7 +377,7 @@ def _park_decomposed_root(conn) -> str:
     kb.recompute_ready(conn)
     _claim_running(conn, tid)
     for _ in range(BLOCK_RECURRENCE_LIMIT + 1):
-        kb.block_task(conn, tid, reason="needs a human answer", kind="needs_input")
+        kb.block_task(conn, tid, reason="needs a human answer", kind="transient")
         if kb.get_task(conn, tid).status == "triage":
             break
         assert kb.unblock_task(conn, tid)

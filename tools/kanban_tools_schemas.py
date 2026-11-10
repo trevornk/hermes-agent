@@ -176,7 +176,8 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "``reason`` is shown to the human on the board; optional ``brief`` "
         "sets a decision brief at the top of the card description. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
-        "auto-escalated to triage. Use for genuine blockers only — don't "
+        "auto-escalated to triage, except needs_input stays blocked awaiting "
+        "the human answer. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
     ),
     {

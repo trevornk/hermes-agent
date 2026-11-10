@@ -423,7 +423,9 @@ what put it there. A subsequent *re-block for the same reason* did: after a task
 is blocked → unblocked → re-blocked for the same cause `BLOCK_RECURRENCE_LIMIT`
 times (default `2`), the unblock-loop breaker stops sending it back to `blocked`
 — where a cron would just keep unblocking it — and routes it to `triage` for
-orchestration attention. This is a deterministic DB guard, not an LLM judgment call, and
+orchestration attention. `needs_input` is exempt: repeated unanswered human
+questions stay in `blocked`, with `loop_detected: true` and `limit` on the `blocked`
+event payload. This is a deterministic DB guard, not an LLM judgment call, and
 a task's body text cannot opt out of it: the recurrence counter deliberately
 survives each unblock (it resets only on a successful `complete`). To keep an
 unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
@@ -1461,7 +1463,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `completed` | `{result_len, summary?}` | Worker wrote `--result` / `--summary` and task hit `done`. `summary` is the first-line handoff (400-char cap); full version lives on the run row. If `complete_task` is called on a never-claimed task with handoff fields, a zero-duration run is synthesized so `run_id` still points at something. |
 | `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, or `null` for a generic block); `recurrences` is the unblock-loop counter. A `kind=dependency` block with no incomplete parent lands here as `needs_input` (payload adds `requested_kind: dependency`, `rekind_reason: no_open_parent`) because `todo` would only get it re-promoted and respawned on the next dispatch tick. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |
 | `dependency_wait` | `{reason, kind}` or `{reason: parent_not_done, demoted: true, parent}` | Worker blocked with `kind=dependency` while at least one parent is still open — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked` and no recurrence is counted. No human needed. Also emitted when `link`/`kanban_link` puts a `ready` child under a parent that is not `done`: the child drops back to `todo` and this event records why (the `ready → running` claim re-checks parents, so nothing can run it until the parent completes or the link is removed with `hermes kanban unlink`). |
-| `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for orchestration attention, breaking the unblock↔re-block loop. |
+| `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). `capability`, `transient`, and untyped blocks route to `triage` for orchestration attention, breaking the unblock↔re-block loop. `needs_input` stays `blocked` and emits `blocked` with `loop_detected: true` and `limit` instead. |
 | `unblocked` | — | `blocked → ready` (or `todo` if parents are still open), either manually or via `/unblock`. Resets the dispatcher's `consecutive_failures` but deliberately preserves `block_recurrences` so the loop breaker keeps its memory. `run_id` is `NULL`. |
 | `archived` | — | Hidden from the default board. If the task was still running, carries the `run_id` of the run that was reclaimed as a side effect. |
 

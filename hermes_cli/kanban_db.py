@@ -110,9 +110,11 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
-# Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
+# Same-kind block -> unblock -> re-block cycles before loop detection.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
+# A repeated unanswered human question is not a loop; its place is Blocked.
+BLOCK_LOOP_TRIAGE_EXEMPT_KINDS = frozenset({"needs_input"})
 # Board-UI/human identities: Desktop uses desktop, the dashboard defaults to
 # dashboard, and trev is the human chore assignee. Profile names are agents.
 HUMAN_COMMENT_AUTHORS = frozenset({"desktop", "dashboard", "trev", "trevor"})
@@ -905,7 +907,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
     -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
-    -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
+    -- ``blocked`` so a cron can't spin it forever, except ``needs_input``
+    -- stays in ``blocked`` awaiting the human's answer. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0
@@ -3324,7 +3327,9 @@ def _route_block(
     incoming one means blocked -> unblocked -> re-block for the same cause
     (un-typed None compares equal to a prior un-typed block). A
     human reply since the last block restarts the count at 1. At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human, except
+    ``needs_input`` stays ``blocked`` with ``loop_detected`` on its ``blocked``
+    event payload: an unanswered human question is not agent churn.
     ``triage_round_trips`` is read from the card's own escalation history (see
     :func:`triage_round_trips`) and lands on the ``block_loop_detected`` payload, so
     a count that spans a triage trip is not read as N consecutive honest blocks.
@@ -3339,6 +3344,10 @@ def _route_block(
         payload["human_reply_reset"] = True
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
+        # needs_input at the loop limit stays in Blocked: the human has not answered yet.
+        if kind in BLOCK_LOOP_TRIAGE_EXEMPT_KINDS:
+            payload["loop_detected"] = True
+            return "blocked", "blocked", set_sql, (kind, recurrences), payload
         # ``recurrences`` alone reads as N consecutive honest blocks. Record how many
         # triage round-trips the count already spans, so the reader who re-blocks this
         # card after a trip cannot describe it as a state that never changed.
