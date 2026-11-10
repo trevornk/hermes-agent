@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 from agent.verify.recipes import Recipe
 from hermes_cli.process_identity import release_process_group_once_empty, spawn_owned
+from tools.environments.local_pythonpath import _strip_hermes_owned_pythonpath_and_runtime_markers
 
 DEFAULT_PHASE_TIMEOUT = 600.0
 DEFAULT_READY_TIMEOUT = 60.0
@@ -91,13 +92,19 @@ def _tail(text: str, limit: int = _TAIL_CHARS) -> str:
     return text[-limit:] if len(text) > limit else text
 
 
+def _recipe_env() -> dict[str, str]:
+    env = os.environ.copy()
+    _strip_hermes_owned_pythonpath_and_runtime_markers(env)
+    return env
+
+
 def _run_phase_command(
     phase: str, command: str, root: Path, timeout: float,
     on_output: Callable[[str], None] | None = None,
 ) -> PhaseResult:
     started = time.monotonic()
     try:
-        proc = subprocess.run(command, cwd=str(root), timeout=timeout, **_SUBPROCESS_KW, check=False)
+        proc = subprocess.run(command, cwd=str(root), timeout=timeout, env=_recipe_env(), **_SUBPROCESS_KW, check=False)
         output, exit_code, timed_out = proc.stdout or "", proc.returncode, False
     except subprocess.TimeoutExpired as exc:
         raw = exc.output
@@ -175,7 +182,7 @@ def _run_start_phase(
     started = time.monotonic()
     # Owned: the app leads its own group (clean group teardown below) and that group dies with this
     # process if it is killed mid-poll, instead of leaving the dev server running on the port.
-    proc = spawn_owned(recipe.start, purpose="verify-app", cwd=str(root), **_SUBPROCESS_KW)
+    proc = spawn_owned(recipe.start, purpose="verify-app", cwd=str(root), env=_recipe_env(), **_SUBPROCESS_KW)
     output = ""
     try:
         ready, status, error = _poll_readiness(url, ready_timeout)

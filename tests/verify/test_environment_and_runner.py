@@ -3,9 +3,11 @@
 import http.server
 import json
 import os
+import site
 import subprocess
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,6 +20,43 @@ from agent.verify.environment import (
 )
 from agent.verify.recipes import Recipe
 from agent.verify.runner import run_verify
+from tests.waiting import wait_until
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("phase", ["test", "start"])
+def test_recipe_commands_strip_hermes_runtime_env(tmp_path, monkeypatch, phase):
+    # Use real runtime discovery, including local's import-time initialization;
+    # do not seed the sanitizer's ownership caches.
+    repo = Path(__file__).resolve().parents[2]
+    runtime_sites = site.getsitepackages()
+    user_path = str(tmp_path / "user-libs")
+    pythonpath = os.pathsep.join([str(repo), *runtime_sites, user_path])
+    monkeypatch.setenv("PYTHONPATH", pythonpath)
+    for marker in ("PYTHONHOME", "VIRTUAL_ENV", "CONDA_PREFIX"):
+        monkeypatch.setenv(marker, str(tmp_path / "runtime"))
+
+    if phase == "test":
+        output = []
+        result = run_verify(tmp_path, Recipe(name="env", test=["env"]),
+                            phases=(phase,), on_output=output.append)
+        assert result.ok
+        child_output = "".join(output)
+    else:
+        def ready(*args):
+            wait_until(lambda: (tmp_path / "ready").exists(), what="start command completed")
+            return True, 200, None
+
+        monkeypatch.setattr("agent.verify.runner._poll_readiness", ready)
+        result = run_verify(tmp_path, Recipe(name="env", start="env > start.env && touch ready"),
+                            phases=(phase,))
+        assert result.ok
+        child_output = (tmp_path / "start.env").read_text()
+
+    child_env = dict(line.split("=", 1) for line in child_output.splitlines() if "=" in line)
+    assert child_env["PYTHONPATH"] == user_path
+    assert all(marker not in child_env for marker in ("PYTHONHOME", "VIRTUAL_ENV", "CONDA_PREFIX"))
+    assert os.environ["PYTHONPATH"] == pythonpath
 
 
 class TestManifest:
