@@ -315,6 +315,12 @@ def _board(board: Optional[str], *, quiet_close: bool = False):
     overrides it per call. ``quiet_close`` swallows close() errors (best-effort bridges)."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
+    try:
+        refusal = kb.fenced_cross_board_refusal(board)
+    except ValueError as exc:  # malformed slug
+        raise _Reject(str(exc)) from exc
+    if refusal:
+        raise _Reject(refusal)
     conn = kbc.connect(board=board)
     try:
         yield kb, conn
