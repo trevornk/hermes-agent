@@ -140,6 +140,24 @@ def test_quickstart_runs_all_three_legs(client, capable_hardware, monkeypatch, t
     Each leg is asserted by its observable call, in order."""
     calls: list[str] = []
 
+    # The quickstart preflight calls the REAL hardware probe: on a machine whose budget fits
+    # no catalog variant (e.g. ram_available_bytes=0), recommended_entry() returns None and
+    # the route answers 409 before any leg runs. These tests assert leg SEQUENCING, so pin a
+    # budget that comfortably fits a catalog entry and keep the assertions about the legs.
+    from hermes_cli.local_runtime.estimator import HardwareBudget as _HardwareBudget
+
+    _big_budget = _HardwareBudget(
+        usable_vram_bytes=64 * 1024**3,
+        total_device_bytes=64 * 1024**3,
+        ram_available_bytes=64 * 1024**3,
+        uma=True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.hardware.probe_budget",
+        lambda *a, **k: _big_budget,
+    )
+
+
     # Supply the same supported backend to preflight and the stubbed install;
     # host auto-detection may select a GPU backend this test host cannot install.
     from hermes_cli.config import load_config, save_config
@@ -201,6 +219,24 @@ def test_quickstart_skips_satisfied_legs(client, capable_hardware, monkeypatch):
     """Runtime present and model already staged: the response says so and
     the job goes straight to activation."""
     calls: list[str] = []
+
+    # The quickstart preflight calls the REAL hardware probe: on a machine whose budget fits
+    # no catalog variant (e.g. ram_available_bytes=0), recommended_entry() returns None and
+    # the route answers 409 before any leg runs. These tests assert leg SEQUENCING, so pin a
+    # budget that comfortably fits a catalog entry and keep the assertions about the legs.
+    from hermes_cli.local_runtime.estimator import HardwareBudget as _HardwareBudget
+
+    _big_budget = _HardwareBudget(
+        usable_vram_bytes=64 * 1024**3,
+        total_device_bytes=64 * 1024**3,
+        ram_available_bytes=64 * 1024**3,
+        uma=True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.hardware.probe_budget",
+        lambda *a, **k: _big_budget,
+    )
+
 
     monkeypatch.setattr(
         "hermes_cli.local_runtime.binaries.installed_engine", lambda *args, **kwargs: Engine("cpu", "b10362", Path("unused")))

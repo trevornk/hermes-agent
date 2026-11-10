@@ -86,15 +86,31 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     # this machine's real gateways: discovery returns nothing, systemd is
     # unsupported, so the phase is a clean no-op for both snapshots.
     import hermes_cli.gateway as hermes_gateway
-
+    # (v2026.9.24: upstream removed _m()._purge_stale_hermes_modules(), so the
+    # sys.modules purge that used to discard these stubs no longer exists and
+    # nothing needs neutralizing; only the stubs below remain load-bearing.)
+    # _restart_manual_gateways() (hermes_cli/update_cmd_fleet.py) imports find_gateway_pids /
+    # find_profile_gateway_processes / _get_service_pids from hermes_cli.gateway at call time.
+    # These stubs MUST mirror the real signatures. _restart_manual_gateways() calls
+    # find_gateway_pids(exclude_pids=..., all_profiles=True); a stub that only accepts
+    # all_profiles raises TypeError, the surrounding best-effort handler swallows it, and
+    # the REAL discovery then runs and finds (and signals) the machine's live gateway.
     monkeypatch.setattr(
-        hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
+        hermes_gateway,
+        "find_gateway_pids",
+        lambda exclude_pids=None, all_profiles=False: [],
     )
     monkeypatch.setattr(
         hermes_gateway, "supports_systemd_services", lambda: False
     )
     monkeypatch.setattr(
-        hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
+        hermes_gateway,
+        "find_profile_gateway_processes",
+        lambda exclude_pids=None, *, strict=False: [],
+    )
+    # Never let the restart phase enumerate real service PIDs on the host.
+    monkeypatch.setattr(
+        hermes_gateway, "_get_service_pids", lambda all_profiles=False: set()
     )
 
 def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):

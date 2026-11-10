@@ -17116,8 +17116,22 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
         "hermes_cli.auth.is_provider_explicitly_configured",
         lambda _slug: False,
     )
-    # A host signed in to Claude Code / Anthropic OAuth would otherwise keep the anthropic row.
-    monkeypatch.setattr("hermes_cli.inventory._anthropic_oauth_credentials_present", lambda: False)
+    # _filter_explicit_provider_rows() also keeps a row when AMBIENT credentials exist, and those
+    # probes read the REAL host: a machine with an Anthropic OAuth sign-in (or a signed-in external
+    # CLI) keeps the "anthropic" row and fails the assertion below. Pin them so this measures the
+    # filter rather than the developer's credentials.
+    monkeypatch.setattr(
+        "hermes_cli.inventory._anthropic_oauth_credentials_present", lambda: False,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory._external_process_signed_in", lambda _slug: False,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory._provider_is_keyless", lambda _slug: False,
+        raising=False,
+    )
     monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_args, **_kwargs: None)
 
