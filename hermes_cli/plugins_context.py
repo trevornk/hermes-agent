@@ -229,17 +229,14 @@ class PluginContext(PluginCapabilityCtxMixin):
         _facade().logger.debug("Plugin %s registered on_unload callback", self.manifest.name)
         return handle
 
-    def spawn_task(self, coro, *, name: Optional[str] = None) -> asyncio.Task:
-        """Spawn a supervised asyncio task; unload/force reload cancels it. Needs a running loop."""
-        if not _facade().asyncio.iscoroutine(coro):
-            raise TypeError("spawn_task expects a coroutine")
-        loop = _facade().asyncio.get_running_loop()
-        task_name = name or f"plugin:{self.plugin_id}:task"
-        task = loop.create_task(coro, name=task_name)
-        handle = self._track("background_task", task_name, lambda: task.done() or task.cancel())
-        task.add_done_callback(lambda _t: handle.dispose())
-        _facade().logger.debug("Plugin %s spawned supervised task: %s", self.manifest.name, task_name)
-        return task
+    def spawn_task(self, coro, *, name: Optional[str] = None) -> Any:
+        """Spawn profile-bound work; unload/force reload requests cancellation.
+
+        Return an asyncio.Task on a running loop, otherwise a concurrent Future
+        on a Hermes daemon loop (its ``thread`` can be joined after cancellation).
+        """
+        from hermes_cli.plugins_tasks import spawn_profile_task
+        return spawn_profile_task(self, coro, name=name)
 
     def register_approval_transport(self, name: str, present_fn: Callable) -> None:
         """Register a human approval transport, inactive until ``security.approval.transport:

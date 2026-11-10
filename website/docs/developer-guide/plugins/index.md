@@ -974,6 +974,7 @@ def register(ctx):
 - Called exactly once at startup
 - `ctx.register_tool()` puts your tool in the registry — the model sees it immediately
 - `ctx.register_hook()` subscribes to lifecycle events
+- `ctx.spawn_task(coro)` starts supervised background work, including from synchronous `register(ctx)`; see [Supervised background work](#supervised-background-work).
 - `ctx.register_cli_command()` registers a CLI subcommand (e.g. `hermes my-plugin <subcommand>`)
 - `ctx.register_command()` registers an in-session slash command (e.g. `/myplugin <args>` inside CLI / gateway chat) — see [Register slash commands](#register-slash-commands) below
 - `ctx.dispatch_tool(name, arguments)` — call any other tool (built-in or from another plugin) with the parent agent's context (approvals, credentials, task_id) wired up automatically. Useful from slash-command handlers that need to invoke `terminal`, `read_file`, or any other tool as if the model had called it directly.
@@ -998,6 +999,23 @@ def register(ctx):
 ```
 
 The dispatched tool goes through the normal approval, redaction, and budget pipelines — it's a real tool invocation, not a shortcut around them.
+
+### Supervised background work
+
+Use `ctx.spawn_task(coro, name="watcher")` from `register(ctx)` to start background
+work under the plugin manager's profile scope. With a running event loop it returns
+an `asyncio.Task`. Without one, Hermes runs the coroutine on a daemon thread with
+its own event loop and returns a `concurrent.futures.Future` with a `thread`
+attribute. Use `result(timeout=...)` to wait from synchronous code, or
+`asyncio.wrap_future(handle)` to await that future. Unload and force reload request
+cancellation through the owning loop; coroutine cleanup and loop shutdown then
+finish on the thread. A cancelled future reports `done()` before cleanup finishes;
+`handle.thread.join(timeout=...)` can wait for thread termination. Exceptions on
+the daemon loop are logged and retained by the future. Secret-source loading runs
+off the event loop. The owning scope is always bound, including before gateway
+multiplex activation. In single-profile mode, credentials absent from that scope
+still fall back to the process environment.
+
 
 ### Store settings and runtime state
 
