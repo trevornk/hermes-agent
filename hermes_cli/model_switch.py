@@ -1392,9 +1392,14 @@ def _route_from_model_input(st: _Switch) -> Optional[ModelSwitchResult]:
     from hermes_cli.models import detect_provider_for_model
     raw_input, current_provider = st.raw_input, st.current_provider
     try:
-        from hermes_cli.config import load_config
-        from hermes_cli.moa_config import exact_moa_preset_name, normalize_moa_config
-        moa_match = exact_moa_preset_name(normalize_moa_config(load_config().get("moa") or {}), raw_input)
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.inventory import _raw_config_has_enabled_moa_preset
+        from hermes_cli.moa_config import exact_moa_preset_name
+        # Merged defaults and normalize_moa_config({}) both synthesize a "default"
+        # preset. Only explicit user configuration may opt a plain switch into MoA.
+        moa_match = None
+        if _raw_config_has_enabled_moa_preset():
+            moa_match = exact_moa_preset_name((read_raw_config() or {}).get("moa"), raw_input)
     except Exception:
         moa_match = None  # MoA config unreadable: fall through to plain alias resolution
     if moa_match:

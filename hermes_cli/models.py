@@ -1061,7 +1061,9 @@ def _static_catalog_matches(name: str, current_provider: str):
     # from: the user configured it deliberately and may serve the same model name there.
     if current_provider != "custom" and not current_provider.startswith("custom:"):
         for pid in static_catalog_providers():
-            if pid in current_keys or pid in _AGGREGATOR_PROVIDERS or pid in _BORROWED_MODEL_PROVIDERS:
+            # MoA catalog entries are virtual preset names, not native models.
+            # Explicit preset/provider selection is handled by the switch path.
+            if pid in current_keys or pid in _AGGREGATOR_PROVIDERS or pid in _BORROWED_MODEL_PROVIDERS or pid == "moa":
                 continue
             if _model_in_provider_catalog(name_lower, {pid}):
                 yield (pid, name)
