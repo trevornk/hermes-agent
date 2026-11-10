@@ -14,15 +14,17 @@ import pytest
 
 from tools.computer_use import cua_backend
 from tools.computer_use.cua_backend_capture import _CaptureMixin
+from tools.computer_use.cua_backend_session import _CuaDriverSession
 
 
 class _StubCapture(_CaptureMixin):
-    """Capture-lane shell: enough state for ``_gws_args``, no driver, no session."""
+    """Capture-lane shell: enough state for ``_gws_args``, no driver; an undiscovered session (no schemas)."""
 
     def __init__(self) -> None:
         self._active_pid: Optional[int] = 607
         self._active_window_id: Optional[int] = 382
         self._session_id: Optional[str] = None
+        self._session = _CuaDriverSession(None)
         self._last_app = ""
 
     def _resolve_capture_windows(self, mode: str, app: Optional[str], pid: Optional[int],

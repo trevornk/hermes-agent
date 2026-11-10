@@ -410,6 +410,14 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
         # working; drivers advertising neither (`additionalProperties: false`) must never see the property.
         idx = args.get("element_index")
         token = self._snapshot_tokens.get(idx) if isinstance(idx, int) else None
+        token_only = ("element_index" in args
+                      and self._session.supports_input_property(name, "element_token")
+                      and not self._session.supports_input_property(name, "element_index"))
+        if token_only:
+            if not token:
+                return ActionResult(ok=False, action=name, code="element_token_required",
+                                    message="No token for this element in the current snapshot; capture again.")
+            args = {k: v for k, v in args.items() if k != "element_index"}
         if token and (self._session.supports_input_property(name, "element_token")
                       or self._session.supports_capability("accessibility.element_tokens", tool=name)):
             args["element_token"] = token
