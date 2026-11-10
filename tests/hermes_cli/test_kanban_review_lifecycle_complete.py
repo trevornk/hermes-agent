@@ -451,6 +451,9 @@ def test_respawn_guards_compare_mixed_int_and_iso_times_by_value(conn) -> None:
 
     with kb.write_txn(conn):
         old_pr, guarded = card("old pr"), card("guarded")
+        # These PR links follow a prior worker that crashed without a handoff.
+        for tid in (old_pr, guarded):
+            kb._synthesize_ended_run(conn, tid, outcome="crashed")
         comment(old_pr, iso(90 * 86400))
         comment(guarded, now - 60)
         conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES "

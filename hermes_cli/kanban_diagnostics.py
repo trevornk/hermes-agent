@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Optional
 import json
+import sqlite3
 import time
 
 
@@ -886,6 +887,7 @@ def compute_task_diagnostics(
     now: Optional[int] = None,
     config: Optional[dict] = None,
     graph: Optional[dict] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> list[Diagnostic]:
     """Run every rule for one task; critical first, then error, warning; ties
     broken by most-recent ``last_seen_at``."""
@@ -905,6 +907,9 @@ def compute_task_diagnostics(
         except Exception:
             # A broken rule must never 500 a whole /board request.
             continue
+    if conn is not None:
+        from hermes_cli.kanban_dispatch_health import dispatch_hold_diagnostics
+        out.extend(dispatch_hold_diagnostics(conn, task, now_ts))
     severity_idx = {s: i for i, s in enumerate(SEVERITY_ORDER)}
     out.sort(key=lambda d: (-severity_idx.get(d.severity, -1), -(d.last_seen_at or 0)))
     return out
