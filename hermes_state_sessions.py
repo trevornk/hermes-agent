@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 from agent.session_activity import (
     ActivityProvenance, bound_activity_description, normalize_activity_provenance,
 )
-from hermes_state_errors import SessionActiveWriteGuardError
+from hermes_state_errors import AmbiguousSessionOriginError, SessionActiveWriteGuardError
 from hermes_state_common import (
     _LISTABLE_CHILD_SQL, _RECOVERABLE_END_REASONS,
     _RECOVERABLE_END_REASONS_SQL, _RESET_CHILD_SQL, _RESET_END_REASONS, _legacy_reset_child_sql, _non_continuation_child_sql,
@@ -438,10 +438,11 @@ class SessionSessionsMixin:
 
     def find_session_by_origin(
         self, *, platform: str, chat_id: str, thread_id: Optional[str] = None,
-        user_id: Optional[str] = None,
+        user_id: Optional[str] = None, raise_on_ambiguity: bool = False,
     ) -> Optional[str]:
         """Most recent live session_id for source + chat_id (+ thread_id). With ``user_id`` exact sender
-        matches win; several distinct users and no match → None (never another participant's session)."""
+        matches win; several distinct users and no match → None (never another participant's session).
+        ``raise_on_ambiguity`` lets fallback callers distinguish refusal from clean absence."""
         if not platform or chat_id in (None, ""):
             return None
         query = """
@@ -463,8 +464,12 @@ class SessionSessionsMixin:
             if exact:
                 return str(exact[0]["id"])
             if len(rows) > 1:
+                if raise_on_ambiguity:
+                    raise AmbiguousSessionOriginError("no matching participant among multiple sessions")
                 return None
         elif len({u for u in (str(r.get("user_id") or "").strip() for r in rows) if u}) > 1:
+            if raise_on_ambiguity:
+                raise AmbiguousSessionOriginError("multiple participants without a user match")
             return None
         return str(rows[0]["id"])
 
