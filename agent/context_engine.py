@@ -71,6 +71,11 @@ class ContextEngine(ABC):
     # False keeps successful automatic compaction passes silent (routine background
     # maintenance); warnings, errors and manual /compress still surface.
     emit_automatic_compaction_status: bool = True
+    # carry-marker: compression-pin-capability
+    # True only for an engine whose compress() consumes ``context_compressor.pin_summary_route`` (the host's
+    # stall-fallback retry pins a different route, or the deterministic sentinel, and re-runs compress()). An engine
+    # that ignores the pin would just repeat the stalled route, so the host skips the retry for it.
+    honors_summary_route_pin: bool = False
 
     @abstractmethod
     def update_from_response(self, usage: dict[str, Any]) -> None:

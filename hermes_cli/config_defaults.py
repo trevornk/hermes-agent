@@ -640,6 +640,11 @@ DEFAULT_CONFIG = {
         # commit is never abandoned: past the ceiling it is logged (WARNING, then ERROR) and
         # surfaced on the warning channel while the host keeps waiting.
         "context_total_ceiling_seconds": 600,
+        # Blocking-wait cap when the request already FITS the model window (nothing forces the
+        # compaction): after this long the request is sent uncompressed and the worker keeps running
+        # so its commit can land for a later call. Over-window / unknown-window requests keep the
+        # idle/ceiling budgets above. Non-positive = no cap.
+        "fits_window_blocking_seconds": 45,
         # Non-system head messages always kept verbatim, in ADDITION to the (always protected)
         # system prompt. 0 = pin nothing but system prompt + summary + tail.
         "protect_first_n": 3,

@@ -2141,6 +2141,8 @@ class ContextCompressor(
     """Default context engine: prune tool results, protect head/tail, summarize the middle
     with an LLM, and iteratively update the previous summary on later compactions."""
 
+    honors_summary_route_pin = True  # compress() reads take_pinned_summary_route / take_deterministic_summary_pin
+
     @property
     def name(self) -> str:
         return "compressor"

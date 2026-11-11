@@ -11,6 +11,7 @@ fence instead of adding the configured limit to the time they started waiting.
 from __future__ import annotations
 
 import contextlib
+import math
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
 # Defaults for the in-agent progress-aware wrap; mirror hermes_cli.config.DEFAULT_CONFIG["compression"] keys.
 DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
 DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
+DEFAULT_FITS_WINDOW_BLOCKING_SECONDS = 45.0
 
 
 def resolve_context_compression_timeouts(compression_cfg: Optional[dict] = None) -> tuple[float, float]:
@@ -55,6 +57,30 @@ def resolve_context_compression_timeouts(compression_cfg: Optional[dict] = None)
             ceiling = max(ceiling, _aux_budget)
             idle = max(idle, min(_aux_budget, ceiling))
     return idle, ceiling
+
+
+def resolve_fits_window_blocking_seconds(compression_cfg: Optional[dict] = None) -> Optional[float]:
+    """Blocking-wait cap for a request that already fits the model window, or ``None`` for "no cap".
+    ``compression.fits_window_blocking_seconds``: missing => 45 s; non-positive or invalid => ``None``, i.e. the
+    idle/ceiling budgets above stay in force."""
+    cfg = compression_cfg
+    if cfg is None:
+        cfg = {}
+        with contextlib.suppress(Exception):
+            from hermes_cli.config import load_config
+            raw = load_config()
+            maybe = raw.get("compression", {}) if isinstance(raw, dict) else {}
+            cfg = maybe if isinstance(maybe, dict) else {}
+    value = cfg.get("fits_window_blocking_seconds") if isinstance(cfg, dict) else None
+    if value is None:
+        return DEFAULT_FITS_WINDOW_BLOCKING_SECONDS
+    if isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if math.isfinite(seconds) and seconds > 0 else None
 
 
 def effective_ceiling(fence: CompressionCommitFence, ceiling: float, wait_started: float) -> float:

@@ -503,6 +503,8 @@ class CompressionCommitFence:
         self._retain_cancelled_lock_until_worker_done = False
         # Set once the active-row watermark is captured: later rows survive as tail, so hosts may keep admission.
         self._commit_watermark_fenced = False
+        # Host veto evaluated under the fence lock at admission (see compression_late_adoption).
+        self._admission_check: Optional[Callable[[], bool]] = None
         if total_ceiling_seconds is not None:
             self.set_total_ceiling_seconds(total_ceiling_seconds)
 
@@ -533,6 +535,10 @@ class CompressionCommitFence:
             return alive
         finally:
             self._lock.release()
+
+    def set_admission_check(self, check: Optional[Callable[[], bool]]) -> None:
+        """Install a host veto for :meth:`begin_commit`; it must be cheap and side-effect free."""
+        self._admission_check = check
 
     def set_idle_timeout_seconds(self, seconds: float) -> None:
         """Publish the host's no-progress budget for external compressors.
@@ -624,10 +630,21 @@ class CompressionCommitFence:
                 # A revoke that lost the fence-lock race deferred its lease release; commit refused: release now.
                 self.release_cancelled_compression_lock()
             return False
+        if self._admission_check is not None and not self._admission_check_passes():
+            self._cancelled = True
+            self._lock.release()
+            return False
         self._commit_started = True
         # Set under the fence lock so commit_in_flight is never True for a commit that lost to cancellation.
         self._commit_phase.set()
         return True
+
+    def _admission_check_passes(self) -> bool:
+        try:
+            return bool(self._admission_check())
+        except Exception:
+            logger.warning("compression commit admission check raised; refusing the commit", exc_info=True)
+            return False
 
     def finish_commit(self) -> None:
         """Leave a commit boundary entered by :meth:`begin_commit`."""
@@ -993,6 +1010,13 @@ def _retry_compression_on_fallback_chain(
     hard_cancel = getattr(telemetry_agent, "_hard_interrupt_requested", None)
     if callable(getattr(hard_cancel, "is_set", None)) and hard_cancel.is_set():
         return None
+    engine = getattr(telemetry_agent, "context_compressor", None)
+    if engine is not None and getattr(engine, "honors_summary_route_pin", None) is not True:
+        logger.info(
+            "Skipping compression stall fallback: engine %s does not honor summary-route pins (a retry would "
+            "repeat the stalled route, including the deterministic sentinel)", type(engine).__name__,
+        )
+        return None
     for route in _stall_retry_routes(escalate_deterministic):
         recovered = _run_pinned_compression_retry(
             route, worker=worker, messages=messages, system_prompt_fallback=system_prompt_fallback,
@@ -1099,18 +1123,43 @@ def _run_pinned_compression_retry(
     return result_msgs, result_prompt
 
 
+# carry-marker: compression-fits-window-blocking-cap
+# Returned (as the "result" of an unsettled wait) when the fits-window blocking cap expired: the worker is
+# still healthy and un-cancelled, the host just stops waiting for it.
+_FITS_WINDOW_DETACHED = object()
+_FENCE_POLL_SECONDS = 0.25
+
+
 def _await_worker_within_budget(
-    future: Any, fence: CompressionCommitFence, *, idle: float, ceiling: float, wait_started: float
+    future: Any, fence: CompressionCommitFence, *, idle: float, ceiling: float, wait_started: float,
+    host_cap_deadline: Optional[float] = None,
 ) -> tuple[bool, Any]:
-    """Poll ``future`` under the idle budget + ceiling; ``(True, result)`` when it settled."""
+    """Poll ``future`` under the idle budget + ceiling; ``(True, result)`` when it settled.
+    ``host_cap_deadline`` is a HOST-side absolute stop (fits-window cap) independent of the fence deadline, which
+    prompt reading keeps pushing back: reaching it returns ``(False, _FITS_WINDOW_DETACHED)``, but only once the
+    worker's commit is watermark-fenced (rows appended after we stop waiting survive as tail)."""
     while True:
         # The fence deadline moves: prompt reading on llama-server pushes it back.
         remaining_ceiling = (fence.deadline_monotonic or wait_started + ceiling) - time.monotonic()
         if remaining_ceiling <= 0:
             return False, None
+        awaiting_fence = False
+        if host_cap_deadline is not None:
+            cap_remaining = host_cap_deadline - time.monotonic()
+            if cap_remaining > 0:
+                remaining_ceiling = min(remaining_ceiling, cap_remaining)
+            elif fence.commit_watermark_fenced:
+                return False, _FITS_WINDOW_DETACHED
+            else:
+                # Without the start watermark a late commit could clobber turns appended after we stop waiting
+                # (the gateway makes the same call): keep the old budgets and the cancel-on-timeout unwind, but
+                # keep polling so the cap applies the moment the worker holds its lease + watermark.
+                awaiting_fence = True
         # Charge idle budget from LAST PROGRESS, not slice start, or silence could approach 2x the budget.
         since_progress = fence.seconds_since_progress()
         wait_slice = min(max(idle - since_progress, 0.005), remaining_ceiling)
+        if awaiting_fence:
+            wait_slice = min(wait_slice, _FENCE_POLL_SECONDS)
         try:
             return True, future.result(timeout=wait_slice)
         except concurrent.futures.TimeoutError:
@@ -1125,6 +1174,8 @@ def _await_worker_within_budget(
             waited = time.monotonic() - wait_started
             since_progress = fence.seconds_since_progress()
             if not fence.deadline_exceeded and since_progress < idle:
+                if awaiting_fence:
+                    continue
                 logger.info(
                     "Context compression still streaming after %.0fs (last progress %.1fs ago) — extending wait (ceiling %.0fs)",
                     waited, since_progress, ceiling,
@@ -1220,6 +1271,8 @@ def run_compress_context_with_progress_timeout(
     fallback_worker: Optional[Callable[[CompressionCommitFence], tuple[list, str]]] = None,
     request_exceeds_window: bool = False,
     precommit_deadline_monotonic: Optional[float] = None,
+    fits_window_blocking_seconds: Optional[float] = None,
+    on_fits_window_detach: Optional[Callable[[Any], None]] = None,
 ) -> tuple[list, str]:
     """Run ``worker(fence)`` under a sync progress-aware (idle + ceiling) timeout.
     Budgets bound the PRE-commit phase only: an admitted commit always completes (overrun logged, surfaced
@@ -1229,7 +1282,10 @@ def run_compress_context_with_progress_timeout(
     window, so "continue without compression" is not an option — a stall escalates to the deterministic
     fallback summary on the FIRST timeout instead of waiting for a prior stall in the session (#114594).
     ``precommit_deadline_monotonic``: an absolute deadline inherited from an earlier attempt (the stall
-    retry passes the primary's), clamping this attempt's ceiling so the attempts share one budget."""
+    retry passes the primary's), clamping this attempt's ceiling so the attempts share one budget.
+    ``fits_window_blocking_seconds``: for a request that FITS the window (caller passes it only then; ignored when
+    ``request_exceeds_window``) the host stops waiting after this long and returns the input uncompressed. The
+    worker and fence are left alone, so a healthy compaction still commits for a later call."""
     if idle_timeout_seconds <= 0:
         raise ValueError(
             "run_compress_context_with_progress_timeout requires "
@@ -1352,9 +1408,23 @@ def run_compress_context_with_progress_timeout(
         return messages, _resolve_fallback_prompt()
 
     try:
+        fits_cap = fits_window_blocking_seconds if not request_exceeds_window else None
+        cap_kwargs = {"host_cap_deadline": wait_started + fits_cap} if fits_cap and fits_cap > 0 else {}
         settled, result = _await_worker_within_budget(
-            future, fence, idle=idle, ceiling=ceiling, wait_started=wait_started
+            future, fence, idle=idle, ceiling=ceiling, wait_started=wait_started, **cap_kwargs
         )
+        if not settled and result is _FITS_WINDOW_DETACHED:
+            # Neither cancel nor revoke: the worker keeps its lease and fence and may still commit.
+            handled_exit = True
+            logger.warning(
+                "Context compression still running after %.1fs and the request fits the model window; sending "
+                "it uncompressed and leaving the compaction running in the background",
+                time.monotonic() - wait_started,
+            )
+            if on_fits_window_detach is not None:
+                with _swallow('compress_context fits-window detach callback failed', exc_info=True):
+                    on_fits_window_detach(future)
+            return messages, _resolve_fallback_prompt()
         if settled:
             handled_exit = True
             # The deadline is visible to the worker as well as the host. A cooperative summary call can

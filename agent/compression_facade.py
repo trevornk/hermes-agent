@@ -131,6 +131,8 @@ def _run_under_progress_timeout(
     from agent.conversation_compression import (
         CompressionCommitFence, request_exceeds_model_window, run_compress_context_with_progress_timeout,
     )
+    from agent import compression_late_adoption as late_adoption
+    from agent.conversation_compression_deadline import resolve_fits_window_blocking_seconds
 
     def _snapshot_worker(fence=None, *, same_turn_fallback_recovery=False):
         # #76354 review F3: the pooled worker must NEVER share the caller's live transcript. Plugin/legacy
@@ -142,6 +144,8 @@ def _run_under_progress_timeout(
         # on timeout/cancel); durable SessionDB mutation is already gated behind the commit fence inside
         # compress_context.
         snapshot = copy.deepcopy(messages)
+        if ticket is not None:
+            ticket.record_source(snapshot)
         result_msgs, result_prompt = run(
             fence, target_messages=snapshot, same_turn_fallback_recovery=same_turn_fallback_recovery
         )
@@ -158,7 +162,30 @@ def _run_under_progress_timeout(
     def _on_timeout_cause(total_exhausted, progress_observed):
         timeout_cause.update(total_exhausted=total_exhausted, progress_observed=progress_observed)
 
+    exceeds = request_exceeds_model_window(agent, approx_tokens)
+
+    def _arm_suppression_if_fitting():
+        # carry-marker: compression-fits-window-turn-suppression
+        if exceeds is False:
+            from agent.compression_suppression import REASON_FITS_WINDOW_TIMEOUT, arm
+            arm(agent, REASON_FITS_WINDOW_TIMEOUT, scope="turn")
+
+    # Rotation commits swap the session id under a live turn: only in-place compaction may run detached.
+    fits_cap = (
+        resolve_fits_window_blocking_seconds()
+        if exceeds is False and getattr(agent, "compression_in_place", True) is not False else None
+    )
+    ticket = late_adoption.LateCompression(agent, messages) if fits_cap else None
+    if ticket is not None:
+        active_fence.set_admission_check(ticket.admission_ok)
+
+    def _on_fits_window_detach(future):
+        _arm_suppression_if_fitting()
+        if ticket is not None:
+            late_adoption.register(agent, ticket, future, active_fence)
+
     def _on_timeout(idle, waited, since_progress):
+        _arm_suppression_if_fitting()
         _report_compression_timeout(
             agent, idle=idle, waited=waited, since_progress=since_progress, total_ceiling=total_ceiling, **timeout_cause
         )
@@ -182,7 +209,8 @@ def _run_under_progress_timeout(
         on_timeout_cause=_on_timeout_cause,
         on_commit_overrun=lambda waited, ceiling: _warn_commit_overrun(agent, waited, ceiling), fence=active_fence,
         telemetry_agent=agent, new_fence=_publish_new_fence, fallback_worker=_same_turn_fallback_worker,
-        request_exceeds_window=request_exceeds_model_window(agent, approx_tokens) is True,
+        on_fits_window_detach=_on_fits_window_detach, request_exceeds_window=exceeds is True,
+        fits_window_blocking_seconds=fits_cap,
     )
 
 
@@ -245,10 +273,24 @@ class CompressionFacadeMixin:
         # thread-local state guarded by a per-agent lock so overlapping automatic/manual entrypoints cannot
         # clobber each other's outcome (#98741).
         from agent.conversation_compression import (
-            CompressionCommitFence, compress_context, reset_context_compression_timeout_outcome,
-            resolve_context_compression_timeouts,
+            CompressionCommitFence, _existing_system_prompt, compress_context,
+            reset_context_compression_timeout_outcome, resolve_context_compression_timeouts,
         )
+        from agent.compression_suppression import suppresses_request
         reset_context_compression_timeout_outcome(self)
+        from agent import compression_late_adoption as late_adoption
+        if (settled := late_adoption.intercept(
+            self, messages, system_message, approx_tokens=approx_tokens, force=force,
+            partial=verbatim_tail is not None,
+        )) is not None:
+            return settled
+        if commit_fence is None and (
+            suppressed := suppresses_request(self, approx_tokens, force=force, bypass_cooldown=bypass_cooldown)
+        ):
+            # A deferred no-op, signalled like a cooldown skip so callers refund the attempt and proceed.
+            self._compression_skipped_due_to_lock = None
+            self._compression_blocked_transient = f"suppressed:{suppressed}"
+            return messages, _existing_system_prompt(self, system_message)
         from agent.portal_tags import (
             get_affinity_scope, get_conversation_context, reset_affinity_scope, reset_conversation_context,
             set_affinity_scope, set_conversation_context,
