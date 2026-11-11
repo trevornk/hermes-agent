@@ -2,6 +2,9 @@
 
 import importlib
 import json
+import logging
+
+import pytest
 from unittest.mock import patch, MagicMock
 
 import gateway.mirror as mirror_mod
@@ -208,3 +211,103 @@ class TestSessionsIndexProfileScoping:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "elsewhere"))
 
         assert mirror_mod._find_session_id("telegram", "12345") == "sess_patched"
+
+
+@pytest.mark.parametrize("optional", [False, True])
+def test_absent_transcript_log_level(tmp_path, monkeypatch, caplog, optional):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with caplog.at_level(logging.DEBUG, logger="gateway.mirror"):
+        assert mirror_mod.mirror_to_session(
+            "telegram", "absent", "hello", **({"optional": True} if optional else {}),
+        ) is False
+    misses = [r for r in caplog.records if "no session found" in r.message]
+    assert len(misses) == 1
+    assert misses[0].levelno == (logging.DEBUG if optional else logging.WARNING)
+    assert not optional or not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+@pytest.mark.parametrize("user_id", [None, "unknown"])
+@pytest.mark.parametrize("backend", ["json", "sqlite"])
+def test_optional_ambiguous_participants_never_write(tmp_path, monkeypatch, caplog, user_id, backend):
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(db_path=tmp_path / "test.db")
+    entries = {
+        user: {"session_id": user, "origin": {"platform": "telegram", "chat_id": "group", "user_id": user}}
+        for user in ("alice", "bob")
+    }
+    if backend == "sqlite":
+        for user in entries:
+            db.create_session(user, "telegram", user_id=user, chat_id="group", session_key=f"group:{user}")
+        # A stale, apparently unique JSON entry must not override the DB's refusal.
+        entries.pop("bob")
+        assert db.find_session_by_origin(platform="telegram", chat_id="group", user_id=user_id) is None
+    _, index = _setup_sessions(tmp_path, entries)
+    monkeypatch.setattr(mirror_mod, "_SESSIONS_INDEX", index)
+    try:
+        with patch("hermes_state_registry.acquire", return_value=db), \
+             patch("hermes_state_registry.release_or_close"), \
+             patch.object(mirror_mod, "_append_to_sqlite") as append:
+            assert mirror_mod._find_session_id("telegram", "group", user_id=user_id) is None
+            assert mirror_mod.mirror_to_session("telegram", "group", "hello", user_id=user_id, optional=True) is False
+        append.assert_not_called()
+        assert any(r.levelno == logging.WARNING and "ambiguous" in r.message.lower() for r in caplog.records)
+    finally:
+        db.close()
+
+
+def test_optional_lookup_failure_warns(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = MagicMock()
+    db.find_session_by_origin.side_effect = OSError("lookup broken")
+    with patch("hermes_state_registry.acquire", return_value=db), \
+         patch("hermes_state_registry.release_or_close"):
+        assert mirror_mod.mirror_to_session("telegram", "absent", "hello", optional=True) is False
+    assert any(r.levelno == logging.WARNING and "lookup broken" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("failure", ["corrupt", "unreadable"])
+def test_optional_bad_sessions_index_warns(tmp_path, monkeypatch, caplog, failure):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _, index = _setup_sessions(tmp_path, {})
+    monkeypatch.setattr(mirror_mod, "_SESSIONS_INDEX", index)
+    if failure == "corrupt":
+        index.write_text("{bad json", encoding="utf-8")
+    else:
+        index.unlink()
+        index.mkdir()
+    assert mirror_mod.mirror_to_session("telegram", "absent", "hello", optional=True) is False
+    assert any(r.levelno == logging.WARNING and "sessions.json" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_optional_existing_transcript_mirrors(tmp_path, monkeypatch, explicit):
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(db_path=tmp_path / "test.db")
+    db.create_session("existing", "telegram", chat_id="123", session_key="dm:123")
+    try:
+        with patch("hermes_state_registry.acquire", return_value=db), \
+             patch("hermes_state_registry.release_or_close"):
+            assert mirror_mod.mirror_to_session(
+                "telegram", "123", "hello", optional=True, session_id="existing" if explicit else None,
+            ) is True
+        assert [m["content"] for m in db.get_messages("existing")] == ["hello"]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("session_id", [None, "explicit"])
+def test_optional_sqlite_write_failure_warns(tmp_path, monkeypatch, caplog, session_id):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = MagicMock()
+    db.find_session_by_origin.return_value = "existing"
+    db.append_message.side_effect = OSError("disk full")
+    with patch("hermes_state_registry.acquire", return_value=db), \
+         patch("hermes_state_registry.release_or_close"):
+        assert mirror_mod.mirror_to_session(
+            "telegram", "123", "hello", optional=True, session_id=session_id,
+        ) is False
+    assert any(r.levelno == logging.WARNING and "disk full" in r.message for r in caplog.records)

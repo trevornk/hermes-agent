@@ -430,6 +430,7 @@ def _mirror_sent_message(platform_name, chat_id, mirror_text, thread_id):
         from gateway.session_context import get_session_env
         return bool(mirror_to_session(
             platform_name, chat_id, mirror_text, thread_id=thread_id,
+            optional=True,
             source_label=get_session_env("HERMES_SESSION_PLATFORM", "cli"),
             user_id=get_session_env("HERMES_SESSION_USER_ID", "") or None))
     except Exception:

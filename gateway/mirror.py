@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli.config import get_hermes_home
+from hermes_state_errors import AmbiguousSessionOriginError
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ def _origin_user_id(entry: dict) -> str:
 def mirror_to_session(
     platform: str, chat_id: str, message_text: str, source_label: str = "cli", thread_id: Optional[str] = None,
     user_id: Optional[str] = None, role: str = "assistant", session_id: Optional[str] = None,
+    *, optional: bool = False,
 ) -> bool:
     """Append a delivery-mirror message to the target session's SQLite transcript.
 
@@ -48,6 +50,8 @@ def mirror_to_session(
     pairs that break strict-alternation providers, while a user-role mirror
     collapses safely via the consecutive-user merge.
     Returns True if mirrored, False if no matching session or error. Never raises.
+    ``optional=True`` logs clean absence at DEBUG for best-effort outbound sends;
+    ambiguous routing, lookup failures and write failures still warn.
 
     ``role`` defaults to ``"assistant"`` — correct for the interactive ``send_message`` mirror, where the
     mirrored text is the agent's own outgoing reply (a genuine assistant turn). See #2221.
@@ -56,7 +60,8 @@ def mirror_to_session(
         if not session_id:
             session_id = _find_session_id(platform, str(chat_id), thread_id=thread_id, user_id=user_id)
         if not session_id:
-            logger.warning(
+            log_miss = logger.debug if optional else logger.warning
+            log_miss(
                 "Mirror: no session found for %s:%s thread=%s user=%s (explicit_id=none, origin-scan bailed)",
                 platform, chat_id, thread_id, user_id,
             )
@@ -89,20 +94,27 @@ def _find_session_id(platform: str, chat_id: str, thread_id: Optional[str] = Non
         db = acquire()
         try:
             finder = getattr(db, "find_session_by_origin", None)
-            session_id = finder(platform=platform, chat_id=chat_id, thread_id=thread_id, user_id=user_id) if callable(finder) else None
+            session_id = finder(platform=platform, chat_id=chat_id, thread_id=thread_id, user_id=user_id,
+                                raise_on_ambiguity=True) if callable(finder) else None
             if session_id:
                 return str(session_id)
         finally:
             release_or_close(db)
+    except AmbiguousSessionOriginError as e:
+        # A routing refusal must not fall through to a stale legacy index.
+        logger.warning("Mirror: ambiguous state.db session for %s:%s thread=%s user=%s: %s",
+                       platform, chat_id, thread_id, user_id, e)
+        return None
     except Exception as e:
-        logger.debug("Mirror state.db session lookup failed: %s", e)
+        logger.warning("Mirror state.db session lookup failed: %s", e)
 
     sessions_index = _resolve_sessions_index()
     if not sessions_index.exists():
         return None
     try:
         data = json.loads(sessions_index.read_text(encoding="utf-8-sig"))
-    except Exception:
+    except Exception as e:
+        logger.warning("Mirror sessions.json lookup failed (%s): %s", sessions_index, e)
         return None
 
     def _matches(entry: dict) -> bool:
@@ -120,8 +132,12 @@ def _find_session_id(platform: str, chat_id: str, thread_id: Optional[str] = Non
         if exact_user_matches:
             candidates = exact_user_matches
         elif len(candidates) > 1:
+            logger.warning("Mirror: ambiguous sessions.json session for %s:%s thread=%s user=%s",
+                           platform, chat_id, thread_id, user_id)
             return None
     elif len(candidates) > 1 and len({u.strip() for u in map(_origin_user_id, candidates) if u.strip()}) > 1:
+        logger.warning("Mirror: ambiguous sessions.json session for %s:%s thread=%s user=%s",
+                       platform, chat_id, thread_id, user_id)
         return None
     return max(candidates, key=lambda entry: entry.get("updated_at", "")).get("session_id")
 
