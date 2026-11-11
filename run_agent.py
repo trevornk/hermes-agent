@@ -403,6 +403,9 @@ class AIAgent(
         # Session boundary: the usage anchor describes the OLD transcript; fall back to full estimation.
         self._usage_anchor = None
         self._turn_base_usage_anchor = None
+        # carry-marker: compression-real-progress-breaker (a real new session; rotation never lands here)
+        from agent.compression_progress_breaker import reset as reset_compression_progress_breaker
+        reset_compression_progress_breaker(self)
         # The workspace snapshot is pinned per session (agent/system_prompt.py::_coding_parts); a
         # /new, /resume or /branch on the same agent must re-snapshot at its own session start.
         self._frozen_workspace_snapshot = None

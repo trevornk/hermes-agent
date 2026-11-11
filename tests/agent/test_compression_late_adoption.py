@@ -199,3 +199,34 @@ def test_fingerprint_ignores_private_bookkeeping_keys_but_not_content():
     assert late.fingerprint(a) == late.fingerprint(b)
     b[1]["content"] = "changed"
     assert late.fingerprint(a) != late.fingerprint(b)
+
+
+_BIG_TOOLS = [{"type": "function", "function": {"name": "t", "description": "d" * 40_000, "parameters": {}}}]
+
+
+def _late_state(monkeypatch, result, *, tools):
+    env = _Env(monkeypatch, result=result)
+    env.agent.tools = tools
+    try:
+        live = [{"role": "user" if i % 2 == 0 else "assistant", "content": "x" * 400} for i in range(10)]
+        env.agent._compress_context(live, "sys", approx_tokens=100)
+        env.gate.set()
+        assert _wait_until(env.ticket_done)
+        return late.current(env.agent).state
+    finally:
+        env.gate.set()
+
+
+def _trimmed(messages):
+    return [dict(m, content="x" * 100) if i < 3 else dict(m) for i, m in enumerate(messages)]
+
+
+def test_progress_is_judged_with_system_prompt_and_tools_priced_on_both_sides(monkeypatch):
+    """Same rows, ~22% fewer message tokens: real progress for a bare transcript, but a ~2% wobble once the
+    ~10k-token tool schemas the provider also receives are priced identically on both sides."""
+    assert _late_state(monkeypatch, _trimmed, tools=[]) == "ready"
+    assert _late_state(monkeypatch, _trimmed, tools=_BIG_TOOLS) == "noop"
+
+
+def test_content_identical_late_result_scores_as_noop_with_tools(monkeypatch):
+    assert _late_state(monkeypatch, lambda m: copy.deepcopy(m), tools=_BIG_TOOLS) == "noop"

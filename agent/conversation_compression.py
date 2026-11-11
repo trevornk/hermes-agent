@@ -3601,9 +3601,19 @@ def _candidate_rejected(
     # only to plugins.
     from agent.context_compressor import ContextCompressor
     _is_external_engine = not isinstance(agent.context_compressor, ContextCompressor)
-    _source_tokens = estimate_messages_tokens_rough(messages_before_compression)
-    _candidate_tokens = estimate_messages_tokens_rough(compressed)
-    if _is_external_engine and _candidate_tokens >= _source_tokens:
+    _source_tokens = _candidate_tokens = 0
+    if _is_external_engine:
+        # Materiality, not mere shrinkage: a same-row result with a 1-3% trim used to be committed, and every such
+        # pass superseded and re-inserted the carried tail (36,223 superseded rows for 1,828 uids in production).
+        # Both sides priced like-for-like, system prompt and tools included.
+        from agent.turn_context import _unanchored_request_tokens, compression_made_progress
+
+        _prompt = getattr(agent, "_cached_system_prompt", None) or ""
+        _source_tokens = _unanchored_request_tokens(agent, messages_before_compression, _prompt)
+        _candidate_tokens = _unanchored_request_tokens(agent, compressed, _prompt)
+    if _is_external_engine and not compression_made_progress(
+        len(messages_before_compression), len(compressed), _source_tokens, _candidate_tokens
+    ):
         if messages != messages_before_compression:
             messages[:] = copy.deepcopy(messages_before_compression)
         logger.info(

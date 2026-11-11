@@ -70,11 +70,16 @@ class LateCompression:
 
     def record_source(self, snapshot: list) -> None:
         """Worker thread, right after the deep snapshot: what this attempt is about to compact."""
-        from agent.model_metadata import estimate_messages_tokens_rough
-
         self.source_len = len(snapshot)
-        self.source_tokens = estimate_messages_tokens_rough(snapshot)
+        self.source_tokens = self._request_tokens(snapshot)
         self.source_fp = fingerprint(snapshot)
+
+    def _request_tokens(self, messages: list) -> int:
+        """Anchor-free request estimate, system prompt and tools priced identically for both sides of the
+        progress check (the same helper the preflight path scores with)."""
+        from agent.turn_context import _unanchored_request_tokens
+
+        return _unanchored_request_tokens(self.agent, messages, getattr(self.agent, "_cached_system_prompt", "") or "")
 
     def _prefix_unchanged(self, live: list) -> bool:
         return (
@@ -107,7 +112,6 @@ class LateCompression:
             self.result = result if self.state == "ready" else None
 
     def _classify(self, result: Any) -> str:
-        from agent.model_metadata import estimate_messages_tokens_rough
         from agent.turn_context import compression_made_progress
 
         if not (isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], list)):
@@ -115,10 +119,9 @@ class LateCompression:
         compressed = result[0]
         if compressed is self.live_ref or not compressed:
             return "noop"
-        # Unanchored like-for-like estimates (same rough estimator both sides); kept a thin seam so the
-        # real-token progress check can replace it.
+        # Like-for-like: both sides go through _request_tokens (see there).
         if not compression_made_progress(
-            self.source_len, len(compressed), self.source_tokens, estimate_messages_tokens_rough(compressed)
+            self.source_len, len(compressed), self.source_tokens, self._request_tokens(compressed)
         ):
             logger.info("Late compaction made no real progress (session=%s); not adopting", self.session_id or "none")
             return "noop"

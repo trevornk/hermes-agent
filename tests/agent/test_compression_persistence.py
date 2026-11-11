@@ -240,7 +240,8 @@ class TestFlushAfterCompression:
             agent = self._make_agent(db)
             agent.compression_in_place = True
             original = [
-                {"role": "user", "content": "old question"},
+                # Long enough that the stub summary is a material cut of the whole priced request.
+                {"role": "user", "content": "old question " + "q" * 100_000},
                 {"role": "assistant", "content": "old answer"},
             ]
             agent._flush_messages_to_session_db(original, [])

@@ -350,6 +350,9 @@ class CompressionFacadeMixin:
                     idle_timeout=idle_timeout, total_ceiling=total_ceiling, approx_tokens=approx_tokens,
                 )
             _mirror_result_onto_live_lists(self, result, messages, direct_path=direct_path)
+            # carry-marker: compression-real-progress-breaker
+            from agent.compression_progress_breaker import note_automatic_compaction
+            note_automatic_compaction(self, force=force, bypass_cooldown=bypass_cooldown)
             _rebind_caller_session_context(self)
             return result
         finally:

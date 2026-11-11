@@ -166,6 +166,9 @@ def record_response_usage(
     # The parent's CURRENT prompt size for headroom math (delegate summary budgets): the
     # aggregator's own prompt, never the MoA-folded total (advisor prompts are not in this context).
     agent._last_prompt_size_tokens = int(context_prompt_tokens or aggregator_usage.prompt_tokens or 0)
+    # carry-marker: compression-real-progress-breaker
+    from agent.compression_progress_breaker import observe_real_usage
+    observe_real_usage(agent, agent._last_prompt_size_tokens)
 
     # Persist only provider-confirmed context lengths, not probe tiers.
     if getattr(compressor, "_context_probed", False):

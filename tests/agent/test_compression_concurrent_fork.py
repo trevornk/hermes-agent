@@ -686,7 +686,9 @@ def test_durable_message_committed_before_lease_is_adopted(
     # Frontend takes its snapshot, then another producer commits before this
     # compressor acquires the lease.
     stale_snapshot = [{"role": "user", "content": "old durable"}]
-    db.append_message(parent_sid, "assistant", "late committed before lease")
+    # Long enough that the stub's 2-row summary is a material cut of the whole priced request.
+    late = "late committed before lease " + "x" * 100_000
+    db.append_message(parent_sid, "assistant", late)
     agent = _build_agent_with_db(db, parent_sid)
 
     returned, _system_prompt = agent._compress_context(
@@ -695,10 +697,7 @@ def test_durable_message_committed_before_lease_is_adopted(
 
     agent.context_compressor.compress.assert_called_once()
     compressed_arg = agent.context_compressor.compress.call_args.args[0]
-    assert [m["content"] for m in compressed_arg] == [
-        "old durable",
-        "late committed before lease",
-    ]
+    assert [m["content"] for m in compressed_arg] == ["old durable", late]
     # Must not echo the stale snapshot — compression proceeded on the
     # adopted durable transcript (rotation publishes a child session).
     assert returned is not stale_snapshot
