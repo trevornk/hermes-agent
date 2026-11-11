@@ -417,6 +417,13 @@ class PluginLoaderMixin:
             declared = self._context_engine_declared[plugin_key] = self._declares_context_engine(manifest)
         return declared
 
+    def failed_context_engine_errors(self) -> list[str]:
+        """``plugin: error`` for each plugin whose load failed and whose source registers a context engine.
+        The engine's name need not match its plugin's (hermes-lcm registers ``lcm``), so the declared-engine
+        marker is what ties a failure to the missing engine."""
+        return [f"{p.manifest.name}: {p.error}" for key, p in self._plugins.items()
+                if p.error and self._context_engine_candidate(key, p.manifest)]
+
     def context_engine_after_rearm(self):
         """The registered context engine, after re-arming a failed context-engine plugin load when there is
         none (:meth:`rearm_failed_context_engine`), so the lookup that needs the engine is what heals it."""

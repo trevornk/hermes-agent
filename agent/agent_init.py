@@ -1753,7 +1753,7 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
     return _config_context_length, _custom_providers, _effective_context_length, _model_cfg
 
 
-def _select_context_engine(_agent_cfg):
+def _select_context_engine(_agent_cfg, session_id=None):
     """Config-driven context engine: ``context.engine`` → plugins/context_engine/<name>/ →
     general plugin system → None (built-in ContextCompressor)."""
     from agent.safe_worker_policy import safe_worker_enabled
@@ -1799,8 +1799,14 @@ def _select_context_engine(_agent_cfg):
                 )
 
     if _selected_engine is None and not _copy_failed:
+        _load_errors = ""
+        with suppress(Exception):
+            from hermes_cli.plugins import get_plugin_manager
+            _load_errors = "; ".join(get_plugin_manager().failed_context_engine_errors())
         _ra().logger.warning(
-            "Context engine '%s' not found — falling back to built-in compressor", _engine_name
+            "Context engine '%s' not found — falling back to built-in compressor "
+            "(pid=%s session=%s plugin_load_error=%s)",
+            _engine_name, os.getpid(), session_id, _load_errors or "none",
         )
     return _selected_engine
 
@@ -1824,7 +1830,7 @@ def _compressor_max_tokens(agent):
 
 
 def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
-    _selected_engine = _select_context_engine(_agent_cfg)
+    _selected_engine = _select_context_engine(_agent_cfg, agent.session_id)
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
         # External engines own compaction policy — the host threshold (and its Codex
