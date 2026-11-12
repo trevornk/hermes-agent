@@ -1655,6 +1655,17 @@ def discover_context_files(cwd_path: Path) -> list[tuple[str, str, Path, str]]:
             for kind, finder in _CONTEXT_FILE_CANDIDATES.items() for label, path, content in finder(cwd_path)]
 
 
+def _context_files_cwd(cwd: Optional[str]) -> Path | None:
+    """A deleted process cwd has no project authority; SOUL.md is independent of it."""
+    if cwd is None:
+        try:
+            cwd = os.getcwd()
+        except FileNotFoundError:
+            logger.warning("skipping project-context discovery: the process working directory was deleted")
+            return None
+    return Path(cwd).resolve()
+
+
 def _project_context_suppressed(cwd: Optional[str], cwd_path: Path, allow_install_tree_fallback: bool) -> bool:
     """A FALLBACK-picked cwd inside the Hermes install tree must not gain system-prompt authority (the desktop
     default would load this repo's contributor AGENTS.md). An explicitly configured cwd is honored verbatim —
@@ -1731,8 +1742,10 @@ def build_context_files_prompt(
 
     if safe_worker_enabled():
         return ""
-    cwd_path = Path(cwd if cwd is not None else os.getcwd()).resolve()
-    if _project_context_suppressed(cwd, cwd_path, allow_install_tree_fallback):
+    cwd_path = _context_files_cwd(cwd)
+    if cwd_path is None:
+        sections = []
+    elif _project_context_suppressed(cwd, cwd_path, allow_install_tree_fallback):
         logger.warning(
             "skipping project-context discovery: working-directory resolution fell back to the Hermes "
             "install tree (%s) — set terminal.cwd to your project directory", cwd_path,
