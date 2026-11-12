@@ -155,6 +155,7 @@ _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out
 # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
 # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
 _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = _BOT_COMPLETION_POLL_SECONDS = 5.0
+_KANBAN_RETENTION_CACHE_SECONDS = 30.0
 
 
 def _notif_release_turn(session: dict) -> None:
@@ -371,6 +372,58 @@ def _session_owns_pending_process_notification(session: dict) -> bool:
     from tools.process_registry import process_registry
     from tools.process_registry_awaiting import awaits_notification
     return awaits_notification(process_registry, _session_process_owners(session))
+
+
+def _session_owns_pending_kanban_notification(session: dict) -> bool:
+    """Keep the sole TUI delivery poller alive while subscribed work progresses or awaits delivery.
+    Read-only probes are cached briefly; unreadable boards must never make a session immortal."""
+    # carry-marker: detached-kanban-retention
+    if session.get("_turn_cancel_requested") or session.get("_finalized") or not session.get("session_key"):
+        return False
+    if session.get("_kanban_pending"):
+        return True
+    try:
+        from hermes_cli import kanban_db as _kb
+        now = time.monotonic()
+        chat_ids = (session["session_key"], *(session.get("_kanban_stray_keys") or ()))
+        cached = session.get("_kanban_retention_cache")
+        if cached and cached[0] == chat_ids and now - cached[1] < _KANBAN_RETENTION_CACHE_SECONDS:
+            return cached[2]
+        with _session_profile_runtime_scope(session, hydrate_secrets=False):
+            boards = _kb.list_boards(include_archived=False)
+            unique = {}
+            for board_meta in boards:
+                if not board_meta.get("archived"):
+                    slug, resolved = _kb_board_key(_kb, board_meta)
+                    unique.setdefault(resolved, slug)
+            pending = any(_kb_has_pending_notification(Path(resolved), chat_ids) for resolved in unique)
+        session["_kanban_retention_cache"] = (chat_ids, now, pending)
+        return pending
+    except Exception:
+        logger.debug("kanban retention check failed for %s", session.get("session_key"), exc_info=True)
+        return False
+
+
+def _kb_has_pending_notification(path: Path, chat_ids: tuple) -> bool:
+    """One bounded probe per board, opened like ``kanban_db_notify.count_notify_subs`` (no init/migration)."""
+    import sqlite3
+    if not path.exists():
+        return False
+    query = (
+        "SELECT 1 FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
+        "WHERE LOWER(s.platform) = ? AND s.chat_id IN (" + ",".join("?" for _ in chat_ids) + ") "
+        "AND (t.status IN (?, ?, ?) OR EXISTS ("
+        "SELECT 1 FROM task_events e WHERE e.task_id = s.task_id AND e.id > s.last_event_id "
+        "AND e.kind IN (" + ",".join("?" for _ in _KANBAN_NOTIFY_KINDS) + "))) LIMIT 1"
+    )
+    with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        try:
+            params = ("tui", *chat_ids, "todo", "ready", "running", *_KANBAN_NOTIFY_KINDS)
+            return conn.execute(query, params).fetchone() is not None
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return False
+            raise
 
 
 def _session_process_owners(session: dict) -> set:
