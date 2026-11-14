@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- minimal lifecycle reset at the identity-stamping chokepoint; watchdogs act on stale drains
 """Gateway runtime status helpers: PID/lock/marker files under ``{HERMES_HOME}`` (one set per
 home/profile) that tell whether the gateway daemon is running."""
 
@@ -1143,6 +1144,15 @@ def _prepare_runtime_status_update(
             " ".join(str(part) for part in current_record["argv"])
         )
         if owns_runtime:
+            if _pid_from_record(payload) != current_record["pid"] or _start_times_conflict(
+                payload.get("start_time"), current_record["start_time"]
+            ):
+                # Watchdogs act on draining/active_agents: never attribute the
+                # previous life's lifecycle state to the new process identity.
+                payload.update(
+                    gateway_state="starting", exit_reason=None, restart_requested=False,
+                    active_agents=0, active_work=None,
+                )
             payload.update({
                 key: current_record[key]
                 for key in ("kind", "pid", "argv", "start_time", "hermes_home")
