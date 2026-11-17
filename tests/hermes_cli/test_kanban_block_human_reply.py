@@ -16,7 +16,7 @@ def board(tmp_path, monkeypatch):
         yield conn, kb.create_task(conn, title="Needs a decision")
 
 
-def block(conn, tid, kind="needs_input"):
+def block(conn, tid, kind="transient"):
     assert kb.block_task(conn, tid, kind=kind, reason="Please advise")
     return kb.list_events(conn, tid)[-1]
 
