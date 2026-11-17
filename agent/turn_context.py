@@ -56,6 +56,15 @@ def _preflight_request_tokens(
     agent._request_pressure_anchored = anchored is not None
     if anchored is not None:
         return anchored
+    return _unanchored_request_tokens(agent, messages, system_prompt)
+
+
+def _unanchored_request_tokens(
+    agent: Any, messages: list[dict[str, Any]], system_prompt: str
+) -> int:
+    """Anchor-free (rough/native) request estimate. Compression progress must compare two of
+    THESE: ``_compress_context`` clears the usage anchor, so an anchored pre figure (real
+    provider usage, ~1.2-1.5x rough on Claude) versus a rough post figure scores a no-op as a cut."""
     tools = getattr(agent, "tools", None) or None
     try:
         from agent.codex_responses_adapter import estimate_native_responses_preflight_tokens

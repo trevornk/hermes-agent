@@ -405,7 +405,11 @@ def _run_preflight_passes(
     for _pass in range(_max_preflight_passes):
         _preflight_input = out.messages
         _orig_len = len(_preflight_input)
-        _orig_tokens = _preflight_tokens
+        # Progress is scored like-for-like on anchor-free estimates (_unanchored_request_tokens):
+        # ``_preflight_tokens`` may be provider-anchored, but the post-pass figure never is.
+        _orig_tokens = _tc._unanchored_request_tokens(
+            agent, _preflight_input, out.active_system_prompt or ""
+        )
         out.messages, out.active_system_prompt = agent._compress_context(
             _preflight_input, system_message, approx_tokens=_preflight_tokens,
             task_id=effective_task_id, trigger="turn_start_threshold",
