@@ -282,18 +282,26 @@ def _validate_bot_chat_deliver(deliver: Optional[str]) -> Optional[str]:
     return None
 
 
-def _resolve_cron_context_deliver(deliver: Optional[str]) -> Optional[str]:
+def _resolve_cron_context_deliver(deliver: Optional[str], *, resolve_omitted: bool = True) -> Optional[str]:
     """Resolve ``origin`` to a concrete target for creates made FROM a cron run (the creating
-    session is ephemeral, so by fire time there is no origin). Non-cron sessions: unchanged.
+    session is ephemeral, so by fire time there is no origin). Headless Kanban workers
+    without a push-capable origin use ``local``; other non-cron sessions are unchanged.
     Cron sessions: ``origin`` (or omitted) becomes the creating run's ``platform:chat_id[:thread]``
     from HERMES_CRON_AUTO_DELIVER_*, or ``local`` when it has no concrete target; other
     elements pass through. Otherwise the scheduler would guess a home channel."""
     from gateway.session_context import get_session_env
     from utils import is_truthy_value
-    if not is_truthy_value(get_session_env("HERMES_CRON_SESSION", "")):
-        return deliver
+    cron_session = is_truthy_value(get_session_env("HERMES_CRON_SESSION", ""))
+    if not cron_session:
+        if not get_session_env("HERMES_KANBAN_TASK") or _origin_from_env():
+            return deliver
+        # An omitted failure override must still inherit the job's delivery.
+        if deliver is None and not resolve_omitted:
+            return None
 
     def _creator_target() -> str:
+        if not cron_session:
+            return "local"
         platform = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip()
         chat_id = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
         if not platform or not chat_id:
@@ -306,6 +314,27 @@ def _resolve_cron_context_deliver(deliver: Optional[str]) -> Optional[str]:
     resolved = [_creator_target() if p.lower() == "origin" else p for p in _clean_str_list(str(deliver).split(","))]
     # Order-preserving de-dup: 'origin,local' with a local creator -> 'local'.
     return ",".join(dict.fromkeys(resolved)) or None
+
+
+def _local_delivery_resolution_notice(requested: dict[str, Optional[str]]) -> Optional[str]:
+    """Explain origin-to-local resolution once, including for mixed target lists."""
+    from gateway.session_context import get_session_env
+    from utils import is_truthy_value
+    if is_truthy_value(get_session_env("HERMES_CRON_SESSION", "")):
+        return None
+    fields = []
+    for field, value in requested.items():
+        if value is not None and "origin" not in [p.strip().lower() for p in value.split(",")]:
+            continue
+        resolved = _resolve_cron_context_deliver(value)
+        if resolved != value and "local" in (resolved or "").split(","):
+            fields.append(field)
+    if not fields:
+        return None
+    return (
+        f"{', '.join(fields)}: origin resolved to local. Output for the local target is "
+        "saved but not pushed anywhere. Set an explicit target (e.g. an alerts room, "
+        "platform:chat_id) if someone must be notified.")
 
 
 def _same_origin(base_url: str, configured: str) -> bool:
