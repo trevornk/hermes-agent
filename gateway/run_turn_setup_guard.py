@@ -127,6 +127,8 @@ async def run_preagent_setup(runner, event, source, quick_key: str, run_generati
             if resolved is None:
                 return None, None
             source, session_entry, session_key = resolved
+            from gateway.run_turn import _event_reply_source
+            source = _event_reply_source(source, event)
             prepared, env_tokens = await runner._hmwa_prepare_turn(
                 event, source, session_entry, session_key, quick_key, run_generation,
             )
