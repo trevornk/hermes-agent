@@ -7,6 +7,7 @@ Extracted from ``hermes_cli.web_server``; helpers/state that tests monkeypatch o
 import asyncio
 import contextlib
 import logging
+import os
 import re
 import secrets
 import subprocess
@@ -22,6 +23,7 @@ from hermes_cli.version_info import get_version_info
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_server_gateway import _ACTION_LOG_FILES
 from hermes_cli.web_routers._common import http_failure
+from hermes_constants import get_hermes_home
 
 _log = logging.getLogger("hermes_cli.web_server")
 router = APIRouter()
@@ -270,8 +272,31 @@ async def update_hermes():
         return response
 
     action_id = secrets.token_hex(16)
+    # On Trevor's ai-server install, `hermes update` is normally triggered from inside the
+    # already-running gateway process, and the raw `python -m hermes_cli.main update`
+    # invocation has no LaunchDaemon-aware pause: it restarts the gateway mid-request and
+    # Desktop's un-backed-off WebSocket reconnect loop hammers the restarting process, which
+    # drained file descriptors into an EMFILE that got misread as ~/.hermes/auth.json
+    # corruption and wiped live OAuth credentials (2026-07-31 incident).
+    # ~/.hermes/scripts/hermes-safe-update.sh exists specifically to pause the LaunchDaemons
+    # first and was built to self-detach safely from exactly this call site
+    # (running_under_hermes_service() + submit_detached_if_needed()). Prefer it when present;
+    # every other install falls back to the original raw-update behavior unchanged.
+    # Resolve from the RUNNING profile's home, not a hardcoded host path: deployments differ in
+    # both home and filename (ai-server ~/.hermes/scripts/hermes-safe-update.sh; the Merittas
+    # agent host /var/lib/ai-agent/.hermes/scripts/hermes_safe_update.sh). A hardcoded path makes
+    # every other host silently fall back to the raw update this guard exists to prevent.
+    cmd_override = None
+    for _name in ("hermes-safe-update.sh", "hermes_safe_update.sh"):
+        _candidate = os.path.join(str(get_hermes_home()), "scripts", _name)
+        if os.path.exists(_candidate):
+            cmd_override = ["/bin/bash", _candidate]
+            break
     with http_failure("Failed to spawn hermes update", 500, "Failed to start update"):
-        proc = _spawn_hermes_action(["update"], "hermes-update", env_overrides={"HERMES_ACTION_ID": action_id})
+        proc = _spawn_hermes_action(
+            ["update"], "hermes-update", env_overrides={"HERMES_ACTION_ID": action_id},
+            cmd_override=cmd_override,
+        )
     return {"ok": True, "pid": proc.pid, "name": "hermes-update", "action_id": action_id}
 
 
