@@ -173,7 +173,8 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
-        "``reason`` is shown to the human on the board. If a task keeps "
+        "``reason`` is shown to the human on the board; optional ``brief`` "
+        "sets a decision brief at the top of the card description. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
@@ -184,6 +185,12 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "What you need answered or what stopped you, in one or "
                 "two sentences. Don't paste the whole conversation; the "
                 "human has the board and can ask follow-ups via comments."
+        )),
+        "brief": _prop("string", (
+            "Optional plain-language five-field decision brief: What's happening / "
+            "Decision needed / Recommendation / Risks / Why this needs you. "
+            "Placed at the top of the card description for the human; use when "
+            "blocking with kind needs_input."
         )),
         "kind": {
             "type": "string",
