@@ -17,7 +17,7 @@ from fastapi import HTTPException
 
 from hermes_cli.web_server_sessions import _open_session_db_at_path
 from hermes_state import SessionDB
-from hermes_state_common import SCHEMA_VERSION
+from hermes_state_common import SCHEMA_VERSION, SESSIONS_LIST_REVISION_TRIGGERS
 
 _ADDED_TABLES = ("runtime_epoch", "session_admissions", "worker_executions", "worker_receipts")
 _ADDED_COLUMNS = (("sessions", "runtime_revision"), ("sessions", "runtime_generation"),
@@ -198,7 +198,9 @@ def own_store_client(monkeypatch, _isolate_hermes_home):
 
 def _drop_session_column(path, column):
     with closing(sqlite3.connect(path)) as conn:
-        # SQLite refuses DROP COLUMN while an index references it; a pre-column store has neither.
+        # A pre-column store predates both the index and projection triggers naming that column.
+        for trigger in SESSIONS_LIST_REVISION_TRIGGERS:
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
         conn.execute("DROP INDEX IF EXISTS idx_sessions_effective_activity")
         conn.execute(f"ALTER TABLE sessions DROP COLUMN {column}")
         conn.commit()
@@ -272,6 +274,9 @@ def _lagging_store_with_history(home, rows=400):
             db.append_message("kept", role="user", content=f"history {i} " * 40)
     with closing(sqlite3.connect(path)) as conn:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        # This legacy store predates the projection triggers naming the removed column.
+        for trigger in SESSIONS_LIST_REVISION_TRIGGERS:
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
         conn.execute("DROP INDEX IF EXISTS idx_sessions_effective_activity")
         conn.execute("ALTER TABLE sessions DROP COLUMN last_read_at")
         conn.commit()

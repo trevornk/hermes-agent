@@ -188,22 +188,12 @@ def _pet_changed_payload() -> dict:
     return {"enabled": False}
 
 
-# last_activity_at / _description are left out on purpose: the session activity heartbeat restamps
-# them mid-turn and on idle ticks, so hashing them re-fired sessions.changed every heartbeat window
-# (#98005). Liveness comes from session.active_list, and a real turn still moves message_count.
 _SESSION_SIGNATURE_FIELDS = (
     "id", "source", "session_key", "display_name", "model", "parent_session_id",
     "started_at", "ended_at", "end_reason", "message_count", "tool_call_count",
     "cwd", "git_branch", "git_repo_root", "title", "title_source", "profile_name",
     "archived", "pinned", "hidden", "last_read_at", "handoff_state",
 )
-# path -> (database/WAL mtime, session-table digest, whether that is a fallback rather than a
-# read answer). The mtime guard keeps the normal 0.5 s watch pass stat-only; SQLite is read only
-# after another process actually commits (and for ``utils.RACY_MTIME_WINDOW_NS`` after it, see
-# _settled_mtime).
-_sessions_db_sig_cache: dict[str, tuple[object, tuple | None, bool]] = {}
-
-
 _MTIME_FALLBACK = "mtime-fallback"
 
 
@@ -253,18 +243,93 @@ def _session_rows_sig(conn, mtime):
     return (fields, digest.digest()), False
 
 
+# path -> ((database identity, database/WAL mtime), session-table signature). The mtime guard keeps the
+# normal 0.5 s watch pass stat-only; SQLite is read only after another process
+# actually commits (and for ``utils.RACY_MTIME_WINDOW_NS`` after it, see _settled_mtime).
+_sessions_db_sig_cache: dict[str, tuple[object, tuple | None]] = {}
+
+
+def _session_list_revision(conn):
+    """The trigger-kept list revision (``hermes_state_common.SESSIONS_LIST_REVISION_SQL``), or None on a
+    store no build with those triggers has opened yet. One row, whatever the history size (#146643)."""
+    from hermes_state_common import SESSIONS_LIST_REVISION_KEY
+    from hermes_state_session_revision import session_list_revision_triggers_match
+
+    if not session_list_revision_triggers_match(conn):
+        return None
+    # The triggers write state_meta, so it exists; no row yet means no session write since they landed.
+    row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (SESSIONS_LIST_REVISION_KEY,)).fetchone()
+    return ("revision", row[0] if row else None)
+
+
+def _session_rows_digest(conn, mtime):
+    """Hash every list column of every session: the signature of a store without the revision triggers."""
+    import hashlib
+    from hermes_state_common import SESSION_LIST_FIELDS
+
+    available = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    fields = tuple(field for field in SESSION_LIST_FIELDS if field in available)
+    if not fields:
+        # A state.db without a readable sessions table (foreign schema, legacy
+        # or transient file): keep the old mtime contract so any move still
+        # wakes the sidebar instead of silently never broadcasting.
+        return ("mtime-fallback", mtime)
+    order = " ORDER BY id" if "id" in available else ""
+    # Preserve id ordering while avoiding random table lookups through the TEXT PK autoindex.
+    rows = conn.execute(f"SELECT {', '.join(fields)} FROM sessions NOT INDEXED{order}")
+    digest = hashlib.blake2b(digest_size=16)
+    for row in rows:
+        digest.update(repr(tuple(row)).encode("utf-8", "backslashreplace"))
+        digest.update(b"\0")
+    return (fields, digest.digest())
+
+
 def _session_db_content_sig(db_path: Path):
-    """Digest list/transcript-relevant session rows, excluding unrelated tables.
+    """Signature of the list-relevant session rows, excluding unrelated tables.
 
     ``gateway_heartbeats`` shares state.db and writes every minute. Using the
     database mtime directly therefore emits sessions.changed while no session
-    changed (#98005). Cache behind the DB/WAL mtime, then inspect only the
-    sessions columns that drive Desktop projections. Legacy stores safely use
-    the subset of columns they have. A failed read after a good digest keeps it:
-    digest -> mtime -> digest would broadcast twice.
+    changed (#98005). Cache behind the DB/WAL mtime, then read the revision the
+    sessions triggers keep; a store without them is digested over the sessions
+    columns that drive Desktop projections (legacy stores use the subset they have).
     """
-    return _db_content_sig(
-        db_path, _sessions_db_sig_cache, _session_rows_sig, fallback=lambda mtime: (_MTIME_FALLBACK, mtime))
+    mtime = _newest_mtime_ns((db_path, db_path.with_name(f"{db_path.name}-wal")))
+    identity = None
+    with contextlib.suppress(OSError):
+        stat = db_path.stat()
+        identity = (stat.st_dev, stat.st_ino)
+    cache_key = str(db_path)
+    cached = _sessions_db_sig_cache.get(cache_key)
+
+    if cached is not None and cached[0] == (identity, mtime):
+        return cached[1]
+    if not db_path.exists():
+        _sessions_db_sig_cache[cache_key] = ((identity, mtime), None)
+
+        return None
+
+    conn = None
+    try:
+        from hermes_state import _connect_tracked_db
+        from hermes_state_holders import read_only_db_uri
+
+        conn = _connect_tracked_db(read_only_db_uri(db_path), tracking_path=db_path,
+                                   uri=True, timeout=0.05)
+        revision = _session_list_revision(conn)
+        signature = revision + (identity,) if revision else _session_rows_digest(conn, mtime)
+    except Exception:
+        # A busy/locked read after a good one keeps the last digest and leaves the cached mtime
+        # stale so the next pass re-reads: digest -> mtime -> digest would broadcast twice.
+        if cached is not None and cached[1] is not None and cached[1][0] != "mtime-fallback":
+            return cached[1]
+        signature = ("mtime-fallback", mtime)
+    finally:
+        if conn is not None:
+            conn.close()
+
+    _sessions_db_sig_cache[cache_key] = ((identity, _settled_mtime(mtime)), signature)
+
+    return signature
 
 
 # Filesystem timestamps come from a coarse clock (~4 ms ticks; whole seconds on some filesystems) and

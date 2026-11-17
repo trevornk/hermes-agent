@@ -995,6 +995,13 @@ class SessionSchemaMixin:
             )
         except sqlite3.OperationalError as exc:
             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
+        from hermes_state_common import _SESSIONS_LIST_REVISION_BUMP
+        from hermes_state_session_revision import session_list_revision_triggers_match
+
+        # Advance BEFORE repair: a failed bump must leave tracking invalid, and
+        # writes during an absent/foreign trigger interval must invalidate old readers.
+        if not session_list_revision_triggers_match(cursor):
+            cursor.execute(_SESSIONS_LIST_REVISION_BUMP)
         self._execute_ddl_skipping_settled_triggers(cursor, DEFERRED_INDEX_SQL)  # same ordering constraint (``active``)
 
         # Heal NULL ``active`` rows on every startup: older reconciler builds added ``active``
