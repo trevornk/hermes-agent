@@ -1,5 +1,4 @@
 """Regression for #143833: reuse reset projections without stale SQLite snapshots."""
-import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -7,7 +6,8 @@ from threading import Barrier
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_local import POLICY_PREFIX, _cached_local_lineage_index
+from hermes_state_local import LINEAGE_INDEX_PREFIX, POLICY_PREFIX, _cached_local_lineage_index
+from tests.hermes_state.local_receipts import store_receipt
 
 
 @pytest.fixture
@@ -17,15 +17,14 @@ def db(tmp_path):
     database.create_session('head', source='cli')
     assert database._conn is not None
     database._conn.execute("UPDATE sessions SET end_reason='session_reset' WHERE id='owner'")
-    database._conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (
-        POLICY_PREFIX + 'owner', json.dumps({'session_id': 'owner', 'lineage': ['owner', 'head']})))
+    store_receipt(database._conn, 'owner', ['owner', 'head'])
     database._conn.commit()
     yield database
     database.close()
 
 
 def _receipt_scans(statements):
-    return [sql for sql in statements if 'FROM state_meta' in sql and 'GLOB' in sql and POLICY_PREFIX in sql]
+    return [sql for sql in statements if 'FROM state_meta' in sql and 'GLOB' in sql and LINEAGE_INDEX_PREFIX in sql]
 
 
 def test_unchanged_session_lists_and_counts_scan_receipts_once(db):
@@ -48,8 +47,7 @@ def test_committed_writer_changes_refresh_the_pooled_reader(db, mutation):
     if mutation == 'extend':
         db.create_session('tail', source='cli')
         db._conn.execute("UPDATE sessions SET end_reason='session_reset' WHERE id='head'")
-        db._conn.execute('UPDATE state_meta SET value=? WHERE key=?', (
-            json.dumps({'session_id': 'owner', 'lineage': ['owner', 'head', 'tail']}), POLICY_PREFIX + 'owner'))
+        store_receipt(db._conn, 'owner', ['owner', 'head', 'tail'])
         expected = {'tail'}
     elif mutation == 'retire':
         db._conn.execute('DELETE FROM state_meta WHERE key=?', (POLICY_PREFIX + 'owner',))
@@ -77,8 +75,7 @@ def test_same_connection_transactions_do_not_publish_intermediate_results(db, fi
     expected = (set(), {}) if finish == 'commit' else before
     assert _cached_local_lineage_index(db, conn) == expected
     # Same-connection autocommit writes must invalidate too (data_version alone cannot see them).
-    conn.execute('INSERT OR REPLACE INTO state_meta(key,value) VALUES(?,?)', (
-        POLICY_PREFIX + 'owner', json.dumps({'session_id': 'owner', 'lineage': ['owner', 'head']})))
+    store_receipt(conn, 'owner', ['owner', 'head'])
     conn.commit()
     assert _cached_local_lineage_index(db, conn) == before
 
@@ -163,8 +160,7 @@ def test_read_only_legacy_database_needs_no_schema_change(tmp_path):
     conn.executescript('CREATE TABLE sessions(id TEXT PRIMARY KEY,end_reason TEXT);'
                        'CREATE TABLE state_meta(key TEXT PRIMARY KEY,value TEXT);')
     conn.executemany('INSERT INTO sessions VALUES(?,?)', [('old', 'session_reset'), ('new', None)])
-    conn.execute('INSERT INTO state_meta VALUES(?,?)', (
-        POLICY_PREFIX + 'old', json.dumps({'session_id': 'old', 'lineage': ['old', 'new']})))
+    store_receipt(conn, 'old', ['old', 'new'])
     conn.commit()
     conn.close()
     before = path.read_bytes()

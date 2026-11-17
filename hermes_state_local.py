@@ -7,8 +7,38 @@ from collections import OrderedDict
 from hermes_state_runtime import RuntimeStoreError, _epoch, _json
 
 POLICY_PREFIX = 'gateway.local_policy.v1:'
+LINEAGE_INDEX_PREFIX = 'gateway.local_lineage.v1:'
+LINEAGE_BACKFILL_DONE = 'gateway.local_lineage.backfill.v1'
 API_BINDING_PREFIX = 'gateway.api.binding.v1.'
 API_DECLARED_PREFIX = 'gateway.api.conversation.v1.'
+
+
+def sync_lineage_index(conn, owner, lineage):
+    """Maintain the small listing projection in the receipt writer's transaction."""
+    key = LINEAGE_INDEX_PREFIX + owner
+    if isinstance(lineage, list) and len(lineage) > 1 and all(isinstance(sid, str) for sid in lineage):
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) '
+                     'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, json.dumps(lineage, ensure_ascii=False, separators=(',', ':'))))
+    else:
+        conn.execute('DELETE FROM state_meta WHERE key=?', (key,))
+
+
+def backfill_lineage_index(conn):
+    """Populate legacy projections once, exclusively on a writer connection."""
+    if conn.execute('SELECT 1 FROM state_meta WHERE key=?', (LINEAGE_BACKFILL_DONE,)).fetchone():
+        return
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        if not conn.execute('SELECT 1 FROM state_meta WHERE key=?', (LINEAGE_BACKFILL_DONE,)).fetchone():
+            rows = conn.execute("SELECT key,value FROM state_meta WHERE key GLOB ? AND json_valid(value) "
+                                "AND json_array_length(value, '$.lineage') > 1", (POLICY_PREFIX + '*',)).fetchall()
+            for key, raw in rows:
+                sync_lineage_index(conn, key[len(POLICY_PREFIX):], json.loads(raw)['lineage'])
+            conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (LINEAGE_BACKFILL_DONE, '1'))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def commit_local_session(db, *, epoch, receipt):
@@ -75,6 +105,7 @@ def commit_local_session(db, *, epoch, receipt):
         conn.execute("INSERT INTO gateway_routing(scope,session_key,entry_json,updated_at) VALUES('',?,?,?)",
                      (route, _json(entry), started))
         conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (key, encoded))
+        sync_lineage_index(conn, sid, receipt.get('lineage'))
         if on_create is not None:
             on_create.publish()  # before the row is visible, so no reader lazy-loads around it
         return receipt
@@ -163,6 +194,7 @@ def retire_local_receipts(conn, session_ids):
     gone = [key for key, value in conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?',
                                                (POLICY_PREFIX + '*',))
             if _policy_target(value) in targets]
+    gone += [LINEAGE_INDEX_PREFIX + key[len(POLICY_PREFIX):] for key in gone]
     gone += [key for key, value in conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?',
                                                 (API_DECLARED_PREFIX + '*',)) if value in targets]
     gone += [API_BINDING_PREFIX + sid for sid in targets]
@@ -191,8 +223,8 @@ def release_receipts(conn, owners):
     """Retire *owners*' local receipts (creation policy and legacy binding): the row they guarded now
     belongs to a messaging lane, which restores it from its route like any other platform session."""
     from hermes_state_local_migration import LEGACY_PREFIX
-    conn.executemany('DELETE FROM state_meta WHERE key IN (?,?)',
-                     [(POLICY_PREFIX + owner, LEGACY_PREFIX + owner) for owner in owners])
+    conn.executemany('DELETE FROM state_meta WHERE key IN (?,?,?)',
+                     [(POLICY_PREFIX + owner, LEGACY_PREFIX + owner, LINEAGE_INDEX_PREFIX + owner) for owner in owners])
 
 
 def handoff_head(db, session_id):
@@ -313,12 +345,13 @@ def local_lineage_index(conn):
     reset segment to ``(owner, lineage)`` for the row that represents the conversation. A delete
     of that row removes the whole lineage (``hermes_state_mutation_guards.delete_targets``)."""
     superseded, heads = set(), {}
-    rows = conn.execute("SELECT value FROM state_meta WHERE key GLOB ? AND json_valid(value) "
-                        "AND json_array_length(value, '$.lineage') > 1", (POLICY_PREFIX + '*',)).fetchall()
-    for (raw,) in rows:
-        receipt = json.loads(raw)
-        owner, lineage = receipt.get('session_id'), receipt.get('lineage')
-        if not isinstance(owner, str) or not all(isinstance(sid, str) for sid in lineage):
+    rows = conn.execute(
+        "SELECT x.key,x.value FROM state_meta x WHERE x.key GLOB ? AND json_valid(x.value) "
+        "AND EXISTS (SELECT 1 FROM state_meta pol WHERE pol.key = ? || substr(x.key, ?))",
+        (LINEAGE_INDEX_PREFIX + '*', POLICY_PREFIX, len(LINEAGE_INDEX_PREFIX) + 1)).fetchall()
+    for key, raw in rows:
+        owner, lineage = key[len(LINEAGE_INDEX_PREFIX):], json.loads(raw)
+        if not isinstance(lineage, list) or len(lineage) <= 1 or not all(isinstance(sid, str) for sid in lineage):
             continue
         marks = ','.join('?' * len(lineage))
         ended = dict(conn.execute(f'SELECT id,end_reason FROM sessions WHERE id IN ({marks})', lineage).fetchall())

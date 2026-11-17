@@ -6,7 +6,7 @@ not re-key idempotency digests, queued inputs, subscribers or uncertain claims.
 import json
 import time
 
-from hermes_state_local import POLICY_PREFIX
+from hermes_state_local import POLICY_PREFIX, sync_lineage_index
 from hermes_state_runtime import RuntimeStoreError, _epoch, _json
 import itertools
 
@@ -64,6 +64,7 @@ def _commit_local_target(conn, receipt, routed):
     conn.execute("UPDATE gateway_routing SET entry_json=? WHERE scope='' AND session_key=?",
                  (_json(routed), receipt['route']))
     conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_json(receipt), POLICY_PREFIX + receipt['session_id']))
+    sync_lineage_index(conn, receipt['session_id'], receipt.get('lineage'))
     conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (receipt['session_id'],))
 
 
