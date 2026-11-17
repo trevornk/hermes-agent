@@ -357,6 +357,9 @@ def _init_session(
             "profile_home": profile_home,
             # In-session /model switch, honored on rebuild (/new, resume) — never leaks to siblings via env vars.
             "model_override": None,
+            # Services may dispatch a pending completion before eager resume restores
+            # its model pin. Seed config sync before exposing that first turn.
+            "config_model_seen": _config_model_target(),
             # Async events go to the transport that created the session (stdio for Ink, WS for the dashboard).
             "transport": current_transport() or _stdio_transport,
             "auth_user_id": _transport_auth_user_id(current_transport()),

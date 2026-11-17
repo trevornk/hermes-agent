@@ -1255,10 +1255,17 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         True means adapter admission, not model execution; None means deduplicated or
         terminal. False remains retryable. Claims are settled together for every sibling.
         """
+        if 'cron_origin' in evt:
+            # This source-authenticated producer belongs to a legacy Desktop
+            # runtime. A messaging/Bot Chat authority must never adopt its wake.
+            from tools.async_delegation import return_completion_offer
+            return_completion_offer(evt)
+            return None
         scope = await completion_event_scope_or_refuse(self, evt, "completion notification")
         if scope is None:
             return None  # terminal: never retried
         async with scope:
+
             return await self._deliver_completion_notification_scoped(
                 synth_text, evt, sibling_claims=sibling_claims)
 

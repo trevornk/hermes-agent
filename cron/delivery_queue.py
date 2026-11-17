@@ -288,7 +288,7 @@ def recover_abandoned() -> int:
     fenced: list[tuple[Optional[str], str]] = []
     with _transaction() as conn:
         rows = conn.execute(
-            "SELECT execution_id, job_json, owner_process_id, owner_pid, owner_started_at "
+            "SELECT execution_id, job_json, for_failure, owner_process_id, owner_pid, owner_started_at "
             "FROM deliveries WHERE status='delivering'"
         ).fetchall()
         for row in rows:
@@ -299,6 +299,12 @@ def recover_abandoned() -> int:
                         continue
             elif _owner_is_live(int(row["owner_pid"]), row["owner_started_at"]):
                 continue
+            from cron.desktop_origin import idempotent_queue_target
+            if idempotent_queue_target(json.loads(row['job_json']), bool(row['for_failure'])):
+                conn.execute("""UPDATE deliveries SET status='pending',owner_process_id=NULL,
+                    owner_pid=NULL,owner_started_at=NULL WHERE execution_id=? AND status='delivering'""",
+                    (row['execution_id'],))
+                continue  # publication has a durable idempotency fence, unlike network sends
             error = (
                 "Gateway finished delivery but could not persist its outcome; "
                 "send was not retried."
@@ -373,9 +379,14 @@ def _terminalize_wait_timeout(execution_id: str) -> str:
     )
     with _transaction() as conn:
         row = conn.execute(
-            "SELECT status FROM deliveries WHERE execution_id=?",
+            "SELECT status,job_json,for_failure FROM deliveries WHERE execution_id=?",
             (str(execution_id),),
         ).fetchone()
+        from cron.desktop_origin import idempotent_queue_target
+        if (row is not None and row['status'] == 'delivering'
+                and idempotent_queue_target(json.loads(row['job_json']), bool(row['for_failure']))):
+            # Keep the active claimant; a dead claimant is requeued by recover_abandoned.
+            return ''
         if row is not None and row["status"] == "pending":
             logger.warning(
                 "Cron delivery %s: no live gateway within the wait budget; "
