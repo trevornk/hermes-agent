@@ -1195,7 +1195,13 @@ DEFAULT_CONFIG = {
         },
     },
 
-    "voice": VOICE_DEFAULTS,
+    "voice": {**VOICE_DEFAULTS, "gpt_live": {
+        **VOICE_DEFAULTS["gpt_live"],
+        "auth": "api",
+        "subscription_model": "gpt-live-1-codex",
+        "subscription_voice": "cove",
+    }},
+
     # Native images (vision_analyze, browser screenshots, replayed user images) are re-sent on every later call.
     "vision": {
         # Byte budget for one embedded image (clamped 64 KiB..4 MiB). Raise it for dense phone
