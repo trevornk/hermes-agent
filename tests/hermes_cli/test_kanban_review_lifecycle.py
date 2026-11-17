@@ -453,9 +453,10 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
             conn, review_id, summary="PR ready",
             expected_run_id=claimed.current_run_id,
         )
-        # Ready-lane task with the same fresh PR comment.
+        # Prior worker opened a PR, then crashed without a recorded handoff.
         ready_id = kb.create_task(conn, title="already PRed", assignee="worker")
         kb.add_comment(conn, ready_id, author="worker", body=pr_comment)
+        _prior_crash(conn, ready_id)
 
         assert kbd.check_respawn_guard(conn, ready_id) == "active_pr"
         assert kbd.check_respawn_guard(conn, review_id, lane="review") is None
@@ -481,6 +482,13 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         assert kbd.check_respawn_guard(
             conn, review_id, lane="review"
         ) == "rate_limit_cooldown"
+
+
+def _prior_crash(conn, tid):
+    """The duplicate-PR scenario requires a prior attempt without a handoff."""
+    assert kb.claim_task(conn, tid) is not None
+    kbd._record_task_failure(conn, tid, error="worker exited 1", outcome="crashed",
+                             release_claim=True, end_run=True)
 
 
 def _backdate_comments(conn, tid, seconds=60):
@@ -516,8 +524,10 @@ def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
     with kbc.connect() as conn:
         dev_id = kb.create_task(conn, title="dev own pr", assignee="dev")
         kb.add_comment(conn, dev_id, author="dev", body=pr_comment)
+        _prior_crash(conn, dev_id)
         closer_id = kb.create_task(conn, title="closer recovery", assignee="dev")
         kb.add_comment(conn, closer_id, author="dev", body=pr_comment)
+        _prior_crash(conn, closer_id)
         _backdate_comments(conn, closer_id)
         assert kb.assign_task(conn, closer_id, "closer") is True
 
@@ -553,6 +563,7 @@ def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
     pr_comment = "Opened https://github.com/example/repo/pull/44 for review."
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="same assign", assignee="dev")
+        _prior_crash(conn, tid)
         kb.add_comment(conn, tid, author="dev", body=pr_comment)
         _backdate_comments(conn, tid)
         assert kb.assign_task(conn, tid, "dev") is True
