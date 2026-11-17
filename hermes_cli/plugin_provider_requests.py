@@ -74,13 +74,23 @@ def _codex_auth(url: str) -> tuple[dict[str, str], str]:
 def _xai_auth(url: str) -> tuple[dict[str, str], str]:
     """The profile's xAI Grok sign-in, through the same resolver core's own xAI speech-to-text uses."""
     from agent.turn_failure_copy import oauth_relogin_command
+    from hermes_cli.auth import _load_auth_store, _load_provider_state, read_credential_pool
     from tools.xai_http import resolve_xai_http_credentials
 
+    # The shared HTTP resolver hides pool/refresh failures behind its API-key fallback.
+    # Observe sign-in presence first, before refresh can quarantine/remove a grant: only a
+    # genuinely absent sign-in may authorize a plugin's own optional API-key fallback.
+    had_sign_in = bool(read_credential_pool("xai-oauth") or
+                       _load_provider_state(_load_auth_store(), "xai-oauth"))
     creds = resolve_xai_http_credentials()
     token = str(creds.get("api_key") or "").strip()
     # The resolver falls back to XAI_API_KEY. A plugin that asked for the subscription sign-in must not
     # silently bill the user's API key instead.
     if creds.get("provider") != "xai-oauth" or not token:
+        if had_sign_in:
+            raise ProviderRequestNotSent(
+                "The configured xai-oauth sign-in is unavailable; the request was not sent. "
+                "Check the sign-in before retrying; no API key was used.")
         raise ProviderNotSignedIn(
             f"Not signed in to xAI Grok in Hermes. Run `{oauth_relogin_command('xai-oauth')}`. "
             "An XAI_API_KEY is never used for plugin requests.")
