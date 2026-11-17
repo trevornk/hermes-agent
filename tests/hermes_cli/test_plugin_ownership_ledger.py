@@ -1312,15 +1312,17 @@ def test_spawned_supervised_task_is_cancelled_on_unload():
     cancelled = []
 
     async def scenario():
+        started = asyncio.Event()
         async def forever():
             try:
-                await asyncio.sleep(3600)
+                started.set()
+                await asyncio.Event().wait()
             except asyncio.CancelledError:
                 cancelled.append(True)
                 raise
 
         task = ctx.spawn_task(forever(), name="probe-task")
-        await asyncio.sleep(0)
+        await asyncio.wait_for(started.wait(), timeout=10)
         kinds = {
             registration.kind
             for registration in manager._ownership_ledger["task_probe"]
