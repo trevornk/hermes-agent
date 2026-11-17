@@ -428,16 +428,33 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
         _merge_request_overrides(request_overrides, explicit_request_overrides),
     )
 
+class DelegationCredentialsUnavailable(ValueError):
+    """A correctly configured ``delegation.provider`` cannot supply credentials right now: missing or expired
+    login, exhausted quota, or a credential pool cooled down for the model. Still a ``ValueError`` with the same
+    message, so callers that only catch ``ValueError`` are unchanged; ``delegate_task`` additionally reads it as the
+    cue to start the child on ``delegation.fallback_providers`` instead of refusing. Misconfiguration (an unknown
+    provider, a missing endpoint, a pinned command that is not on PATH) stays a plain ``ValueError``."""
+
+
+def _is_credential_unavailable(exc: Exception) -> bool:
+    """True for the typed auth failure the runtime resolver raises when credentials exist in principle but cannot
+    be used now. An ``invalid_provider`` auth error is a typo, not an outage, so it is excluded."""
+    from hermes_cli.auth_constants import AuthError
+    return isinstance(exc, AuthError) and getattr(exc, "code", None) != "invalid_provider"
+
+
 def _runtime_provider_credentials(v: dict, explicit_request_overrides, explicit_base_url: Optional[str] = None) -> dict:
     """``delegation.provider`` branch: full bundle via the runtime provider system. ``explicit_base_url`` is handed
     to the resolver the way the main agent hands it ``model.base_url``: the provider keeps its own key on it."""
+
     configured_provider = v["provider"]
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
         endpoint = {"explicit_base_url": explicit_base_url} if explicit_base_url else {}
         runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"], **endpoint)
     except Exception as exc:
-        raise ValueError(
+        error_type = DelegationCredentialsUnavailable if _is_credential_unavailable(exc) else ValueError
+        raise error_type(
             f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
             f"Check that the provider is configured (API key set, valid provider name), "
             f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
@@ -447,7 +464,8 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides, explicit_
     api_key = runtime.get("api_key", "")
     if not api_key:
         endpoint_hint = f", or set delegation.api_key for {explicit_base_url}" if explicit_base_url else ""
-        raise ValueError(
+        raise DelegationCredentialsUnavailable(
+
             f"Delegation provider '{configured_provider}' resolved but has no API key. "
             f"Set the appropriate environment variable or run 'hermes auth'{endpoint_hint}."
         )
