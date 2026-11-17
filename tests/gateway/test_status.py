@@ -262,13 +262,76 @@ class TestScopedGatewayPidQuery:
         # A dead PID's stale record is still cleanup-unlinked, scoped or not.
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default-home"))
         profile_dir, pid_path, _ = self._write_scoped_profile(tmp_path)
-        monkeypatch.setattr(status, "is_gateway_runtime_lock_active", lambda lock: True)
+        monkeypatch.setattr(status, "is_gateway_runtime_lock_active", lambda lock: False)
         monkeypatch.setattr(status, "_pid_exists", lambda pid: False)
         assert status.get_running_pid(pid_path) is None
         assert not pid_path.exists()
         # gateway.lock is an ownership inode (gateway/runtime_ownership.py): a stale record
         # is cleared through the PID file only; unlinking the lock would let a contender that
         # already opened it become a second owner.
+        assert (profile_dir / "gateway.lock").exists()
+
+    def test_live_lock_never_unlinks_the_held_lock_file(self, tmp_path, monkeypatch):
+        """A HELD lock file survives poison cleanup (mutual exclusion).
+
+        Regression for the window an independent review found: a legitimate gateway for
+        THIS home can hold the flock while a stale foreign pid record is still on disk
+        (records are written AFTER the lock is taken). Unlinking the held lock pathname
+        would let the next starter create and flock a REPLACEMENT inode -- two live
+        gateways. The poisoned pid file is still cleaned; the lock file is not.
+        """
+        pid_path = tmp_path / "gateway.pid"
+        lock_path = status._get_gateway_lock_path(pid_path)
+        pid_path.write_text(json.dumps({"pid": 4242, "hermes_home": "/some/other/home"}))
+        lock_path.write_text("held-by-a-live-gateway")
+
+        monkeypatch.setattr(status, "is_gateway_runtime_lock_active", lambda _p: True)
+        status._cleanup_invalid_pid_path(pid_path, cleanup_stale=True)
+
+        assert not pid_path.exists(), "poisoned cross-profile pid file must still be cleaned"
+        assert lock_path.exists(), (
+            "held lock file was unlinked -- a replacement inode could be locked "
+            "concurrently, breaking gateway mutual exclusion"
+        )
+        assert lock_path.read_text() == "held-by-a-live-gateway"
+
+    def test_stale_foreign_lock_record_alone_does_not_trigger_cleanup(
+        self, tmp_path, monkeypatch
+    ):
+        """A foreign LOCK record must not by itself defeat the restart-window guard.
+
+        In the pre-write window the lock file still holds the previous owner's bytes, so
+        only the PID record may attest poison. With a live lock and a non-foreign pid
+        record, both identity files stay put.
+        """
+        pid_path = tmp_path / "gateway.pid"
+        lock_path = status._get_gateway_lock_path(pid_path)
+        pid_path.write_text(json.dumps({"pid": 4242, "hermes_home": str(tmp_path)}))
+        lock_path.write_text(json.dumps({"pid": 11, "hermes_home": "/some/other/home"}))
+
+        monkeypatch.setattr(status, "is_gateway_runtime_lock_active", lambda _p: True)
+        status._cleanup_invalid_pid_path(pid_path, cleanup_stale=True)
+
+        assert pid_path.exists(), "restart-window guard must keep this home's pid file"
+        assert lock_path.exists(), "restart-window guard must keep the lock file"
+
+    def test_live_lock_with_dead_record_pid_preserves_identity_files(self, tmp_path, monkeypatch):
+        """Restart window: a NEW process won the flock but has not yet rewritten the record.
+
+        ``acquire_gateway_runtime_lock()`` flocks BEFORE it truncates and dumps its own PID
+        record, so "flock held + on-disk record names the old dead PID" is a real, reachable
+        state.  Unlinking there destroys a healthy gateway's identity files and nothing
+        recreates them until the next restart -- the "gateway is down but it isn't" false
+        alert.  Regression cover for the carried gateway_false_down_alerts guard, which had
+        none.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default-home"))
+        profile_dir, pid_path, _ = self._write_scoped_profile(tmp_path)
+        monkeypatch.setattr(status, "is_gateway_runtime_lock_active", lambda lock: True)
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: False)
+        # No adoptable identity -> None, but the files MUST survive.
+        assert status.get_running_pid(pid_path) is None
+        assert pid_path.exists()
         assert (profile_dir / "gateway.lock").exists()
 
 
