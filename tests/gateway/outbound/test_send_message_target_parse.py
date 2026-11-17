@@ -655,4 +655,5 @@ def test_bare_platform_home_fallback_preserves_thread_id() -> None:
         source_label="cli",
         thread_id="777",
         user_id=None,
+        optional=True,
     )

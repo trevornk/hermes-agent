@@ -6,6 +6,10 @@ import errno
 import re
 import sqlite3
 
+
+class AmbiguousSessionOriginError(LookupError):
+    """Several live sessions match an origin without a unique participant match."""
+
 # Malformed schema: ``sqlite_master`` itself is inconsistent (typically a DUPLICATE
 # ``CREATE VIRTUAL TABLE messages_fts`` row). SQLite parses the whole schema while
 # preparing the FIRST statement, so EVERY statement raises (even ``PRAGMA

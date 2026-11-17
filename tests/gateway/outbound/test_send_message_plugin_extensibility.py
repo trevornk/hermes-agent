@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -304,3 +305,23 @@ def test_declared_target_syntax_and_standalone_policy_drive_send_routing():
         platform_registry.unregister(name)
     assert result == {"success": True}
     assert calls == [{"chat_id": "room-1", "message": "", "thread_id": None, "media_files": media, "caption": "hi"}]
+
+
+def test_successful_send_without_transcript_is_optional(plugin_platform, tmp_path, monkeypatch, caplog):
+    name, _entry, seen = plugin_platform
+    _platform, _pconfig, config = _config_for(name)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    caplog.set_level(logging.DEBUG, logger="gateway.mirror")
+
+    with patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("tools.interrupt.is_interrupted", return_value=False):
+        result = json.loads(send_message_tool({
+            "target": f"{name}:@Alice@Example.COM",
+            "message": "hello",
+        }))
+
+    assert result["success"] is True
+    assert "mirrored" not in result
+    assert seen[-1]["chat_id"] == "@alice@example.com"
+    assert any("no session found" in r.message for r in caplog.records)
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records if r.name == "gateway.mirror")
