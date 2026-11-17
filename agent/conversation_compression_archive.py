@@ -134,3 +134,32 @@ def coverage_for_commit(
     if not covered and not marked:
         return None, None
     return covered, unresolved
+
+
+def untagged_carried_tail(held: Sequence[Any], compressed: Sequence[Any]) -> list[dict[str, Any]]:
+    """Dicts of *compressed* that carry a message of *held* forward, matched by ``message_uid``.
+
+    The built-in compressor tags its carried tail (``_compaction_tail``), so the commit counts it and flags
+    the superseded originals rewind-only. A plugin context engine hands back the same fresh tail untagged:
+    ``tail_count`` is 0 and every original stays ``compacted=1`` beside its re-inserted twin, which message
+    search returns twice. Naming these dicts as ``carried_messages`` reuses the route micro-compaction takes.
+
+    The uid only selects candidates. ``archive_and_compact`` resolves each to its ACTIVE durable original by
+    row id or unique identity + timestamp and checks role/content/tool identity, so a rewritten or merged row
+    that kept its uid resolves to nothing and its original stays archived history. A fresh summary row has no
+    uid yet.
+    """
+    held_uids = {m.get("message_uid") for m in held if isinstance(m, dict) and m.get("message_uid")}
+    return [m for m in compressed if isinstance(m, dict) and m.get("message_uid") in held_uids]
+
+
+def with_untagged_tail(
+    carried: Optional[Sequence[Any]], held: Sequence[Any], compressed: Sequence[Any], tail_tagged: bool,
+) -> Optional[Sequence[Any]]:
+    """*carried* plus, when the engine tagged no tail, the verbatim carries of *compressed* (``untagged_carried_tail``).
+
+    A tagged tail already reaches the commit as ``tail_count``, so *carried* is returned untouched. Otherwise the
+    caller's own carries (the reply anchor) stay and the untagged tail is added to them.
+    """
+    extra = [] if tail_tagged else untagged_carried_tail(held, compressed)
+    return [*(carried or ()), *extra] if extra else carried
