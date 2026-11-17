@@ -87,6 +87,11 @@ def _pre_dispatch_housekeeping(_sched, headless: bool) -> None:
     except Exception as _legacy_exc:
         _sched.logger.warning("Legacy Bot Chat pending drain failed: %s", _legacy_exc, exc_info=True)
     _sched._maybe_reap_dead_owners()
+    try:
+        from cron.desktop_origin import sweep_ended_origin_completions
+        sweep_ended_origin_completions()
+    except Exception:
+        _sched.logger.warning("Desktop ended-origin completion sweep failed", exc_info=True)
 
 
 def _tick_admitted(

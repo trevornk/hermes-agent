@@ -6,15 +6,29 @@ Native worker execution remains the scheduler/supervisor's responsibility.
 """
 from __future__ import annotations
 
+from contextlib import closing
+
 import hashlib
 import json
+import logging
 import os
+import sqlite3
 import sys
 import time
 
 from hermes_constants import get_hermes_home
 
 PLATFORM = 'desktop-owner'
+_ENDED_ORIGIN_DROP_GRACE_S = 7 * 86400
+_ENDED_ORIGIN_ALERT_GRACE_S = 3600
+logger = logging.getLogger(__name__)
+
+
+class _OriginGone(ValueError):
+    def __init__(self, message, reason, ended_at=None):
+        super().__init__(message)
+        self.reason = reason
+        self.ended_at = ended_at
 
 
 def capture_origin():
@@ -68,9 +82,9 @@ def _validate_origin(db, origin):
     row = db.get_session(tip)
     if any(r is None or r.get('user_id') != origin['principal_id']
            or r.get('source') not in ('desktop', 'tui', 'gui') for r in (root, row)):
-        raise ValueError('Desktop origin identity/lineage no longer exists')
+        raise _OriginGone('Desktop origin identity/lineage no longer exists', 'origin_identity_gone')
     if row.get('expiry_finalized') or (row.get('ended_at') and row.get('end_reason') != 'compression'):
-        raise ValueError('Desktop origin has ended')
+        raise _OriginGone('Desktop origin has ended', 'origin_ended', row.get('ended_at'))
     return tip
 
 
@@ -100,6 +114,98 @@ def compact_completion_history(conn, cutoff, keep=1000):
              json.dumps({'owner_followthrough': result.get('owner_followthrough', {})}), key))
 
 
+def _queue_ended_origin_alert(event):
+    """Use the scheduler's durable explicit-target handoff, never a new transport."""
+    from cron.delivery_queue import enqueue
+    key, goal = event['delegation_id'], event['goal']
+    alert_id = key + '-origin-ended-alert'
+    try:
+        receipt = enqueue(alert_id, {
+            'id': alert_id, 'name': goal,
+            'deliver': 'matrix:!ZudlWNSxyHvqGwIkdv:sppun.com',
+        }, f"Desktop owner unavailable for {key} ({goal}):\n{event['summary']}", for_failure=True)
+    except Exception:
+        logger.warning("Desktop completion %s (%s) origin unavailable; failure alert unavailable", key, goal, exc_info=True)
+        return 'unavailable'
+    # Queued is not a delivery acknowledgment; the scheduler records the send outcome.
+    return receipt['status']
+
+
+def _ended_origin_action(db, event, result, now):
+    """A current end is resumable; only identity loss or an aged end can expire a receipt."""
+    try:
+        _validate_origin(db, event.get('cron_origin'))
+    except _OriginGone as exc:
+        if exc.reason == 'origin_identity_gone':
+            return exc.reason, True
+        age = now - exc.ended_at if exc.ended_at is not None else 0
+        if age > _ENDED_ORIGIN_DROP_GRACE_S:
+            return exc.reason, True
+        if (age > _ENDED_ORIGIN_ALERT_GRACE_S and event.get('status') == 'error'
+                and 'alert' not in result.get('owner_followthrough', {})):
+            return exc.reason, False
+    except ValueError:
+        pass  # Invalid profile/binding is not proof that a lineage ended.
+    return None
+
+
+def _settle_ended_origin_candidate(db, key, now):
+    from tools import async_delegation as ledger
+    with ledger._DB_LOCK, ledger._transaction() as conn:
+        # Re-read both the claim and lineage after serializing with session/claim writes.
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute("""SELECT event_json,result_json,delivery_claim,delivery_claimed_at
+            FROM async_delegations WHERE delegation_id=? AND delivery_state=?
+            AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
+            (key, 'pending', now - ledger._CLAIM_LEASE_S)).fetchone()
+        if row is None:
+            return 0
+        event, result = json.loads(row[0]), json.loads(row[1])
+        action = _ended_origin_action(db, event, result, now)
+        if action is None:
+            return 0
+        reason, drop = action
+        followthrough = result['owner_followthrough']
+        if event.get('status') == 'error' and 'alert' not in followthrough:
+            # Commit the idempotent queue id first: a ledger rollback cannot duplicate a send.
+            followthrough['alert'] = _queue_ended_origin_alert(event)
+        if drop:
+            followthrough.update(status='dropped', reason=reason, finished_at=now)
+            logger.info("Desktop completion %s (%s) dropped: %s", key, event['goal'], reason)
+        conn.execute("""UPDATE async_delegations SET delivery_state=?,result_json=?,
+            updated_at=?,delivery_claim=?,delivery_claimed_at=? WHERE delegation_id=?""",
+            ('dropped' if drop else 'pending', json.dumps(result), now,
+             None if drop else row[2], None if drop else row[3], key))
+    return 1
+
+
+def sweep_ended_origin_completions():
+    """Alert aged failures and expire old ended origins without requiring a loaded UI."""
+    from hermes_state import SessionDB
+    from tools import async_delegation as ledger
+    path = ledger._db_path()
+    if not path.exists():
+        return 0
+    now = time.time()
+    # The usual empty tick must not initialize SessionDB or take state.db's writer lock.
+    with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as conn:
+        rows = conn.execute("""SELECT delegation_id,event_json,result_json FROM async_delegations
+            WHERE delegation_id LIKE ? AND delivery_state=?
+            AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
+            ('cron-owner-%', 'pending', now - ledger._CLAIM_LEASE_S)).fetchall()
+    if not rows:
+        return 0
+    db = SessionDB(path)
+    changed = 0
+    try:
+        for key, event_raw, result_raw in rows:
+            if _ended_origin_action(db, json.loads(event_raw), json.loads(result_raw), now) is not None:
+                changed += _settle_ended_origin_candidate(db, key, now)
+    finally:
+        db.close()
+    return changed
+
+
 def publish_completion(job, content, *, for_failure=False):
     """Idempotent terminal publication, not an owner-consumption acknowledgment."""
     from hermes_state import SessionDB
@@ -111,7 +217,10 @@ def publish_completion(job, content, *, for_failure=False):
     origin = job.get('origin')
     db = SessionDB(get_hermes_home() / 'state.db')
     try:
-        _validate_origin(db, origin)
+        try:
+            _validate_origin(db, origin)
+        except _OriginGone:
+            pass  # Persist for reopen; periodic housekeeping applies the alert/drop graces.
     finally:
         db.close()
     key = 'cron-owner-' + hashlib.sha256(json.dumps(
