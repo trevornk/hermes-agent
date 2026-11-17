@@ -274,19 +274,21 @@ def _run_worker_turns(agent, frame, history):
             return agent.run_conversation(frame['text'], conversation_history=history, **worker_display_kwargs(),
                                           **({'task_id': task_id} if task_id else {}),
                                           **({'turn_author': author} if author is not None else {}))
-    from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
+    from hermes_cli.turn_exit import credential_failure_flags, owner_transport_failed, turn_exit_code
     code, last_output = 1, ''
     try:
         result = _run_task_turns(agent, frame, history, context)
-        code = turn_exit_code(result, kanban_worker=True)
+        code = turn_exit_code(result, kanban_worker=True, owner_unavailable=owner_transport_failed(agent))
         if isinstance(result, dict):
             # Redact before the tail cut: a cut through a PEM header or a token prefix
             # leaves a body the redactor no longer recognises.
             from hermes_cli import kanban_db as kb
             last_output = kb.redact_review_value(str(result.get('final_response') or ''))[-500:]
+
         return result
     except Exception as exc:
-        code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
+        code = turn_exit_code(None, kanban_worker=True, owner_unavailable=owner_transport_failed(agent, exc),
+                              **credential_failure_flags(exc))
         raise
     finally:
         _record_worker_result(context, code, last_output)
@@ -298,8 +300,9 @@ def record_start_failure(frame, exc):
     context = json.loads(frame['policy'].get('kanban_json') or 'null')
     if context is None:
         return
-    from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
-    _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '')
+    from hermes_cli.turn_exit import credential_failure_flags, owner_transport_failed, turn_exit_code
+    _record_worker_result(context, turn_exit_code(None, kanban_worker=True, owner_unavailable=owner_transport_failed(None, exc),
+                                                  **credential_failure_flags(exc)), '')
 
 
 def _record_worker_result(context, code, last_output):
