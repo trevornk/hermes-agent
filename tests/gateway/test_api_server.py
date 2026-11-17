@@ -987,7 +987,7 @@ class TestSkillsEndpoint:
         with patch(
             "tools.skills_tool.find_all_skills",
             return_value=list(fake_skills),
-        ):
+        ) as find_all_skills:
             app = _create_app(adapter)
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/v1/skills")
@@ -998,6 +998,7 @@ class TestSkillsEndpoint:
                 assert names == ["ascii-art", "github"]
                 for entry in data["data"]:
                     assert set(entry.keys()) >= {"name", "description", "category"}
+            find_all_skills.assert_called_once_with(skip_disabled=False)
 
 
 class TestToolsetsEndpoint:
