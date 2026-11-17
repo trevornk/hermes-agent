@@ -355,6 +355,7 @@ class TestGatewayRuntimeStatus:
     def test_write_runtime_status_overwrites_stale_pid_on_restart(self, tmp_path, monkeypatch):
         """Regression: setdefault() preserved stale PID from previous process (#1631)."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(sys, "argv", ["hermes_cli/main.py", "gateway", "run", "--replace"])
 
         # Simulate a previous gateway run that left a state file with a stale PID
         state_path = tmp_path / "gateway_state.json"
@@ -371,6 +372,25 @@ class TestGatewayRuntimeStatus:
         payload = status.read_runtime_status()
         assert payload["pid"] == os.getpid(), "PID should be overwritten, not preserved via setdefault"
         assert payload["start_time"] != 1000.0, "start_time should be overwritten on restart"
+
+    def test_non_gateway_platform_write_preserves_gateway_identity(self, tmp_path, monkeypatch):
+        """A one-shot `hermes send` must not poison gateway_state.json."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        gateway_argv = ["hermes_cli/main.py", "gateway", "run", "--replace"]
+        monkeypatch.setattr(sys, "argv", gateway_argv)
+        status.write_runtime_status(gateway_state="running")
+        owner = status.read_runtime_status()
+        assert owner is not None
+
+        monkeypatch.setattr(sys, "argv", ["hermes", "send", "--to", "matrix:!room:example.org"])
+        status.write_runtime_status(platform="matrix", platform_state="connected")
+
+        after = status.read_runtime_status()
+        assert after is not None
+        assert after["pid"] == owner["pid"]
+        assert after["argv"] == gateway_argv
+        assert after["start_time"] == owner["start_time"]
+        assert after["platforms"]["matrix"]["state"] == "connected"
 
 
     def test_runtime_status_running_pid_rejects_pid_reused_by_other_profile(self, monkeypatch):
