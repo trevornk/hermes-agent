@@ -203,9 +203,12 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
     "kanban_schedule",
     (
         "Park your task as 'scheduled' while it waits for a time or external event. This ends the current run and makes the "
-        "task non-dispatchable until an orchestrator unblocks it; it does not "
-        "create a timer. Put any wake-up marker such as "
-        "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason``."
+        "task non-dispatchable. To wake it automatically, put "
+        "``SCHEDULED_UNTIL=<ISO8601 with UTC offset>`` (e.g. "
+        "``SCHEDULED_UNTIL=2026-11-01T18:30:00-06:00``) in ``reason``: the "
+        "dispatcher releases the card once that time passes. Without a valid "
+        "marker (missing, unparseable, or no UTC offset) the card has no timer "
+        "and waits for an orchestrator to unblock it."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
