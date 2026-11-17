@@ -139,6 +139,8 @@ def _warn_acl_not_inherited(target: Path) -> None:
 
 class StagedPlugin:
     def __init__(self, plugin: dict):
+        from pm.outer_transaction import refuse_plugin_swap
+        refuse_plugin_swap()
         from pm.store import tree_digest
         from pm.workspace import enabled_plugin_dirs, member_sources
 
