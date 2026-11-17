@@ -10,6 +10,7 @@ publication belong to PM, not this CLI entry point.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -54,6 +55,54 @@ def _checkout(tmp_path: Path, name: str = "co") -> Path:
     (root / "pyproject.toml").write_text("[project]\nname='x'\n")
     (root / "uv.lock").write_text("lock-v1\n")
     return root
+
+
+@pytest.mark.parametrize("own_entry", [True, False])
+def test_managed_worker_skips_launch_probe_only_for_own_entry(tmp_path, monkeypatch, own_entry):
+    import pm
+
+    root = _checkout(tmp_path)
+    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}))
+    script = root / ("agent" if own_entry else "other") / "managed_worker.py"
+    monkeypatch.setattr(sys, "argv", [str(script)])
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+
+    def probe(*, project_root):
+        assert project_root == root
+        pytest.fail("PM launch probe called")
+
+    monkeypatch.setattr(pm, "venv_is_current", probe)
+    if own_entry:
+        assert venv_sync.prepare_launch(root, []) is None
+    else:
+        with pytest.raises(pytest.fail.Exception, match="PM launch probe called"):
+            venv_sync.prepare_launch(root, [])
+
+
+def test_managed_worker_module_has_own_script_identity_at_bootstrap(tmp_path):
+    # Observe the real -m entry before bootstrap runs, without needing an installed environment.
+    (tmp_path / "sitecustomize.py").write_text(textwrap.dedent("""
+        import builtins
+        import json
+        import sys
+
+        original_import = builtins.__import__
+
+        def observe_bootstrap(name, *args, **kwargs):
+            if name == "hermes_bootstrap":
+                print(json.dumps(sys.argv))
+                raise SystemExit(0)
+            return original_import(name, *args, **kwargs)
+
+        builtins.__import__ = observe_bootstrap
+    """), encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-m", "agent.managed_worker"], cwd=REPO_ROOT,
+        env={**os.environ, "PYTHONPATH": str(tmp_path), "HERMES_HOME": str(tmp_path / "home")},
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert Path(json.loads(result.stdout)[0]).resolve() == REPO_ROOT / "agent" / "managed_worker.py"
 
 
 def _wire_pm(monkeypatch, *, current=False, error=None):

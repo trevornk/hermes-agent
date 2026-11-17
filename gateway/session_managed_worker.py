@@ -18,8 +18,8 @@ from agent.managed_worker import ACTIVITY_FRAME, accept_result, activity_interva
 from gateway.session_worker_reservation import owner_worker_subject, reserve_admission_worker
 from hermes_state_runtime import RuntimeStoreError
 
-# The interpreter only imports psutil before it introduces itself; a child silent this long
-# is wedged (loader/stdio stall), not slow.
+# Before hello, bootstrap selects the committed dependencies and the child imports psutil.
+# Managed workers skip launch-time update completion; a child silent this long is wedged.
 HELLO_SECONDS = 60
 # After Stop the child interrupts its agent and emits its result; the owner terminates a
 # child that has not acknowledged within this window instead of waiting on the pipe forever.

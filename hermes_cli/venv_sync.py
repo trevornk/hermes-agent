@@ -452,6 +452,10 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     # sys.argv[0] is this process's script identity; *argv* carries only the command.
     if _is_tail_script(root, sys.argv[0]):
         return None
+    # The gateway already prepared this per-turn child; even probing PM can stall hello.
+    # Own-script identity keeps descendant Hermes commands on the normal launch path.
+    if Path(sys.argv[0]).resolve() == root / "agent" / "managed_worker.py":
+        return None
 
     from hermes_cli._parser import command_argv
     from hermes_cli.steward import read_install_stamp
