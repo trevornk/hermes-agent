@@ -713,6 +713,13 @@ def _resolve_toolsets(params, config, source, safe_mode, coding_posture=False, b
         effective = {t for name in enabled for t in resolve_toolset(name)}
         if not requested <= effective:
             _refuse('toolsets', f"not available on this surface: {', '.join(sorted(requested - effective))}")
+        # An explicit pick is the session's exact allowlist, as `hermes chat -t` is without a gateway.
+        # Upstream #147832 filters unnamed plugin/MCP extensions. Retain the remaining context-engine
+        # runtime-tool boundary; an all/* pick deliberately grants every profile augmentation.
+        if not {'all', '*'} & set(explicit):
+            named = set(explicit) | {name[4:] for name in explicit if name.startswith('mcp-')}
+            enabled = {key for key in enabled
+                       if key in named or ((tools := set(resolve_toolset(key))) and tools <= requested)}
     if explicit is None and source in {'tui', 'gui'}:
         # Same surface toolsets as the native TUI factory, without its env inference.
         # The fold-in lands after _get_platform_tools subtracted agent.disabled_toolsets, so
