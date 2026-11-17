@@ -183,6 +183,12 @@
         "hermes_cli.session_worktree:restore",
         "hermes_cli.session_worktree:finish"
       ]
+    },
+    {
+      "source": "Bundled image provider shared catalog",
+      "entries": [
+        "plugins.image_gen._common:GPT_IMAGE_25_TIERS"
+      ]
     }
   ]
 }
