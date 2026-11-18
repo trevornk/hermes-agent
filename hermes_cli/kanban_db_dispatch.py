@@ -150,6 +150,11 @@ class DispatchResult:
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
 
+    capacity_held: Optional[str] = None
+    """Concurrency cap that held this tick: ``host`` or ``board``."""
+    capacity_running: int = 0
+    capacity_limit: int = 0
+
     spawn_failed: list[str] = field(default_factory=list)
     """Task ids whose workspace preparation or worker launch failed this tick."""
 
@@ -166,6 +171,7 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    capacities: list[str] = []
     for res in results:
         if res is None:
             continue
@@ -179,9 +185,20 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["owner_unavailable"] = counts.get("owner_unavailable", 0) + len(res.owner_unavailable)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        for label, items in (
+            ("per_profile_capped", res.skipped_per_profile_capped),
+            ("nonspawnable", res.skipped_nonspawnable),
+        ):
+            if items:
+                counts[label] = counts.get(label, 0) + len(items)
+        if res.capacity_held:
+            capacities.append(
+                f"capacity_held={res.capacity_held}({res.capacity_running}/{res.capacity_limit})"
+            )
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
+    parts.extend(capacities)
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
@@ -2258,12 +2275,18 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.capacity_held = "board"
+            result.capacity_running = running_count
+            result.capacity_limit = max_spawn
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.capacity_held = "host"
+            result.capacity_running = total_running
+            result.capacity_limit = max_in_progress
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:

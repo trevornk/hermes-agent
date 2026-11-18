@@ -10,6 +10,21 @@ if TYPE_CHECKING:
     from hermes_cli.kanban_diagnostics import Diagnostic
 
 
+def dispatch_tick_is_starved(results: Iterable[Optional[DispatchResult]]) -> bool:
+    """Classify a zero-spawn tick; actionable holds override expected queueing."""
+    results = [res for res in results if res is not None]
+    if any(
+        res.spawn_failed or res.respawn_guarded or res.skipped_unassigned
+        or res.skipped_locked or res.memory_pressure or res.auto_blocked
+        or res.rate_limited or res.owner_unavailable
+        for res in results
+    ):
+        return True
+    return not any(
+        res.capacity_held or res.skipped_per_profile_capped for res in results
+    )
+
+
 def dispatch_health_detail(results: Iterable[Optional[DispatchResult]]) -> str:
     from hermes_cli.kanban_db_dispatch import describe_suppression
 
